@@ -535,7 +535,12 @@ public final class ZSetCommands {
             catch (NumberFormatException e) { throw RedisException.notInteger(); }
         }
         long len = zsetCard(obj);
-        List<ZSetEntry> entries = zsetRangeByRank(obj, max ? len - count : 0, max ? len - 1 : count - 1, max);
+        // For zpopmax: get the last 'count' elements (highest scores) in ascending order, then reverse
+        // For zpopmin: get the first 'count' elements (lowest scores) in ascending order
+        long start = max ? len - count : 0;
+        long stop  = max ? len - 1    : count - 1;
+        List<ZSetEntry> entries = zsetRangeByRank(obj, start, stop, false); // always ascending
+        if (max) Collections.reverse(entries); // return highest-score first for ZPOPMAX
         List<Object> result = new ArrayList<>();
         for (ZSetEntry e : entries) {
             zsetDelete(obj, e.member);

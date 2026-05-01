@@ -1,7 +1,7 @@
 package com.redisimpl.test.integration;
 
 import com.redisimpl.server.RedisServer;
-import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import redis.clients.jedis.Jedis;
@@ -14,59 +14,65 @@ import java.net.Socket;
 
 /**
  * Base class for integration tests.
- * Starts a RedisServer on a random free port and provides a Jedis client.
+ *
+ * Uses a single shared server for ALL integration test classes (started once per JVM).
  */
 public abstract class BaseIntegrationTest {
 
-    protected static RedisServer server;
-    protected static int port;
-    protected static Thread serverThread;
-    protected static JedisPool jedisPool;
+    // ---- Shared server state (one instance for the whole test run) ----
+    private static volatile RedisServer sharedServer;
+    private static volatile int sharedPort;
+    private static volatile Thread sharedServerThread;
+    private static volatile JedisPool sharedPool;
+    private static volatile boolean serverStarted = false;
+
     protected Jedis jedis;
 
     @BeforeAll
-    static void startServer() throws Exception {
-        port = findFreePort();
-        server = new RedisServer(port);
-        serverThread = new Thread(() -> {
+    static synchronized void ensureServerStarted() throws Exception {
+        if (serverStarted) return;
+        sharedPort = findFreePort();
+        sharedServer = new RedisServer(sharedPort);
+        sharedServerThread = new Thread(() -> {
             try {
-                server.start();
+                sharedServer.start();
             } catch (Exception e) {
-                // Server stopped normally or was closed
+                // Server stopped normally
             }
         });
-        serverThread.setDaemon(true);
-        serverThread.start();
+        sharedServerThread.setDaemon(true);
+        sharedServerThread.start();
 
         // Wait until the port is actually accepting connections (max 5 seconds)
-        waitForPort(port, 5000);
+        waitForPort(sharedPort, 5000);
 
-        // Create a connection pool
         JedisPoolConfig config = new JedisPoolConfig();
-        config.setMaxTotal(10);
-        jedisPool = new JedisPool(config, "127.0.0.1", port, 2000);
-    }
+        config.setMaxTotal(20);
+        config.setMaxIdle(10);
+        sharedPool = new JedisPool(config, "127.0.0.1", sharedPort, 2000);
 
-    @AfterAll
-    static void stopServer() {
-        if (jedisPool != null) {
-            jedisPool.close();
-            jedisPool = null;
-        }
-        if (server != null) {
-            server.stop();
-            server = null;
-        }
-        if (serverThread != null) {
-            serverThread.interrupt();
-            serverThread = null;
-        }
+        // Register shutdown hook to stop the server when JVM exits
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (sharedPool != null) sharedPool.close();
+            if (sharedServer != null) sharedServer.stop();
+        }));
+
+        serverStarted = true;
     }
 
     @BeforeEach
-    void connectJedis() {
-        jedis = jedisPool.getResource();
+    void connectJedis() throws Exception {
+        ensureServerStarted();
+        jedis = sharedPool.getResource();
         jedis.flushAll();
+    }
+
+    @AfterEach
+    void closeJedis() {
+        if (jedis != null) {
+            jedis.close();
+            jedis = null;
+        }
     }
 
     private static void waitForPort(int port, long timeoutMs) throws Exception {

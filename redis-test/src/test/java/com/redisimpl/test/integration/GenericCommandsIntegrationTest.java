@@ -34,12 +34,13 @@ class GenericCommandsIntegrationTest extends BaseIntegrationTest {
     @Test
     void exists_key() {
         jedis.set("key", "value");
-        assertEquals(1L, jedis.exists("key"));
+        // Use varargs form which returns Long (single-arg form returns boolean in Jedis 5.x)
+        assertEquals(1L, jedis.exists(new String[]{"key"}));
     }
 
     @Test
     void exists_nonExistent() {
-        assertEquals(0L, jedis.exists("nonexistent"));
+        assertEquals(0L, jedis.exists(new String[]{"nonexistent"}));
     }
 
     @Test
