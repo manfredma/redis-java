@@ -21,7 +21,7 @@ public abstract class BaseIntegrationTest {
 
     // ---- Shared server state (one instance for the whole test run) ----
     private static volatile RedisServer sharedServer;
-    private static volatile int sharedPort;
+    protected static volatile int sharedPort;
     private static volatile Thread sharedServerThread;
     private static volatile JedisPool sharedPool;
     private static volatile boolean serverStarted = false;

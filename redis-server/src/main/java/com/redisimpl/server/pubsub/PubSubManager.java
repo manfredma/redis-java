@@ -8,7 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
+import java.util.function.Consumer;
 
 /**
  * Manages Pub/Sub subscriptions and message delivery.
@@ -94,8 +94,9 @@ public final class PubSubManager {
     /**
      * Publish a message to a channel.
      * Returns the number of clients that received the message.
+     * The flushCallback is called for each recipient so the message is written to the socket.
      */
-    public long publish(String channel, byte[] message) {
+    public long publish(String channel, byte[] message, Consumer<RedisClient> flushCallback) {
         long count = 0;
 
         // Direct channel subscribers
@@ -104,6 +105,7 @@ public final class PubSubManager {
             byte[] msg = encodeMessage("message", channel, message);
             for (RedisClient c : subs) {
                 c.addReply(msg);
+                if (flushCallback != null) flushCallback.accept(c);
                 count++;
             }
         }
@@ -114,6 +116,7 @@ public final class PubSubManager {
                 byte[] msg = encodePMessage(e.getKey(), channel, message);
                 for (RedisClient c : e.getValue()) {
                     c.addReply(msg);
+                    if (flushCallback != null) flushCallback.accept(c);
                     count++;
                 }
             }

@@ -191,6 +191,8 @@ public final class StreamObject {
     public static long[] parseId(String id) {
         if ("-".equals(id)) return new long[]{0, 0};
         if ("+".equals(id)) return new long[]{Long.MAX_VALUE, Long.MAX_VALUE};
+        if ("*".equals(id)) return new long[]{Long.MAX_VALUE, Long.MAX_VALUE}; // NEW_ENTRY sentinel
+        if ("$".equals(id)) return new long[]{Long.MAX_VALUE, Long.MAX_VALUE}; // LAST_ENTRY sentinel
         int dash = id.lastIndexOf('-');
         if (dash < 0) {
             return new long[]{Long.parseLong(id), 0};

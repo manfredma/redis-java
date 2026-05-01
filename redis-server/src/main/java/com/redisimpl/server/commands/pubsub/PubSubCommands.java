@@ -68,7 +68,7 @@ public final class PubSubCommands {
     public byte[] publish(RedisClient client, byte[][] argv) {
         String channel = toStr(argv[1]);
         byte[] message = argv[2];
-        long count = pubSub.publish(channel, message);
+        long count = pubSub.publish(channel, message, server::flushClient);
         return RespEncoder.encodeInteger(count);
     }
 

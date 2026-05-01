@@ -402,7 +402,8 @@ public final class StreamCommands {
                         StreamConsumerGroup.StreamConsumer consumer = group.getOrCreateConsumer(consumerName);
                         consumer.touch();
 
-                        if (">".equals(afterId)) {
+                        // Jedis 5.x sends NEW_ENTRY as "*" (same semantics as ">")
+                        if (">".equals(afterId) || "*".equals(afterId)) {
                             // Deliver new entries
                             String lastId = group.getLastDeliveredMillis() + "-" + group.getLastDeliveredSeq();
                             entries = stream.read(lastId, count);

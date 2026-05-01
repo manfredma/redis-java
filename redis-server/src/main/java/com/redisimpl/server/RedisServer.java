@@ -352,7 +352,7 @@ public final class RedisServer {
 
     // ---- Write ----
 
-    private void flushClient(RedisClient client) {
+    public void flushClient(RedisClient client) {
         if (!client.hasPendingOutput()) return;
         SocketChannel sc = client.getChannel();
         if (sc == null || !sc.isOpen()) return;

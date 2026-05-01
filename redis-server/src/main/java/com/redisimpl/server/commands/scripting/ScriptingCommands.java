@@ -116,19 +116,19 @@ public final class ScriptingCommands {
 
             // Build redis table with call() and pcall()
             LuaTable redisTable = new LuaTable();
-            redisTable.set("call", new LuaFunction() {
+            redisTable.set("call", new org.luaj.vm2.lib.VarArgFunction() {
                 @Override
                 public Varargs invoke(Varargs varargs) {
                     return redisCall(client, varargs, false);
                 }
             });
-            redisTable.set("pcall", new LuaFunction() {
+            redisTable.set("pcall", new org.luaj.vm2.lib.VarArgFunction() {
                 @Override
                 public Varargs invoke(Varargs varargs) {
                     return redisCall(client, varargs, true);
                 }
             });
-            redisTable.set("error_reply", new LuaFunction() {
+            redisTable.set("error_reply", new org.luaj.vm2.lib.VarArgFunction() {
                 @Override
                 public Varargs invoke(Varargs varargs) {
                     LuaTable t = new LuaTable();
@@ -136,7 +136,7 @@ public final class ScriptingCommands {
                     return t;
                 }
             });
-            redisTable.set("status_reply", new LuaFunction() {
+            redisTable.set("status_reply", new org.luaj.vm2.lib.VarArgFunction() {
                 @Override
                 public Varargs invoke(Varargs varargs) {
                     LuaTable t = new LuaTable();

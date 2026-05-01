@@ -37,10 +37,24 @@ public final class HyperLogLog {
      */
     public static boolean add(byte[] regs, byte[] element) {
         long hash = murmurHash64A(element, 0xadc83b19L);
+        // Use lower HLL_BITS bits as register index
         int index = (int) (hash & (HLL_REGISTERS - 1));
-        long remaining = hash >>> HLL_BITS;
-        int leadingZeros = Long.numberOfLeadingZeros(remaining | (1L << (64 - HLL_BITS))) - HLL_BITS;
-        int runLen = leadingZeros + 1;
+        // Use upper (64 - HLL_BITS) bits to compute run length
+        long w = hash >>> HLL_BITS;
+        // Count leading zeros in w (within the 64-HLL_BITS bit space), then add 1
+        // We need to count zeros in the remaining 50 bits.
+        // Set a sentinel bit at position (64-HLL_BITS) to avoid counting past the field.
+        int maxBits = 64 - HLL_BITS; // 50
+        int runLen = 1;
+        // Count leading zeros in w within maxBits bits
+        if (w == 0) {
+            runLen = maxBits + 1; // all zeros
+        } else {
+            // numberOfLeadingZeros counts from bit 63; we want leading zeros in the lower maxBits bits
+            // Shift w so its MSB is at bit 63
+            long shifted = w << HLL_BITS;
+            runLen = Long.numberOfLeadingZeros(shifted) + 1;
+        }
         if (runLen > 63) runLen = 63;
 
         int regIdx = HLL_MAGIC.length + index;
