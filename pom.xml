@@ -16,6 +16,7 @@
     <modules>
         <module>redis-core</module>
         <module>redis-server</module>
+        <module>redis-persistence</module>
         <module>redis-test</module>
     </modules>
 
@@ -91,6 +92,20 @@
                 <artifactId>mockito-junit-jupiter</artifactId>
                 <version>${mockito.version}</version>
                 <scope>test</scope>
+            </dependency>
+
+            <!-- LZF compression -->
+            <dependency>
+                <groupId>com.ning</groupId>
+                <artifactId>compress-lzf</artifactId>
+                <version>1.0.4</version>
+            </dependency>
+
+            <!-- redis-persistence module -->
+            <dependency>
+                <groupId>com.redisimpl</groupId>
+                <artifactId>redis-persistence</artifactId>
+                <version>${project.version}</version>
             </dependency>
 
             <!-- Jedis (integration tests) -->

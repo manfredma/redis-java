@@ -35,7 +35,7 @@ public final class ZSetCommands {
     public static final class ZSetData {
         public final ZSkipList zsl;
         public final Dict dict; // member -> score (Double)
-        ZSetData() { this.zsl = new ZSkipList(); this.dict = Dict.create(); }
+        public ZSetData() { this.zsl = new ZSkipList(); this.dict = Dict.create(); }
     }
 
     // ---- Encoding helpers ----

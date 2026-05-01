@@ -35,8 +35,8 @@ public final class ZSkipListNode {
     /** Level entry: forward pointer + span */
     public static final class ZSkipListLevel {
         /** Forward pointer */
-        ZSkipListNode forward;
+        public ZSkipListNode forward;
         /** Number of nodes skipped by this forward pointer */
-        long span;
+        public long span;
     }
 }

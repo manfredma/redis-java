@@ -234,6 +234,8 @@ public final class ZSkipList {
         return result;
     }
 
+    public ZSkipListNode getHeader() { return header; }
+
     public long length() {
         return length;
     }

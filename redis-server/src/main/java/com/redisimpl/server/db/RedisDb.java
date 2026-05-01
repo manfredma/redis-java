@@ -36,6 +36,22 @@ public final class RedisDb {
 
     public int getId() { return id; }
 
+    /** Returns the raw key-value Dict (for persistence). */
+    public Dict getDict() { return dict; }
+
+    /** Returns the raw expiry Dict (for persistence). */
+    public Dict getExpires() { return expires; }
+
+    /**
+     * Get raw expiry time for a key without existence check.
+     * Returns 0 if no expiry is set.
+     */
+    public long getRawExpiry(byte[] key) {
+        Object exp = expires.get(key);
+        if (exp == null) return 0L;
+        return (Long) exp;
+    }
+
     // ---- Key lookup ----
 
     /**
