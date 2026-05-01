@@ -6,7 +6,9 @@ import lombok.Setter;
 
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * RedisClient — Java port of Redis's client structure in server.h.
@@ -71,6 +73,28 @@ public final class RedisClient {
 
     /** Total bytes in dynamic reply list */
     private long replyBytes;
+
+    // ---- Pub/Sub state ----
+
+    /** Channels this client is subscribed to */
+    private final Set<String> subscribedChannels = new HashSet<>();
+
+    /** Patterns this client is subscribed to */
+    private final Set<String> subscribedPatterns = new HashSet<>();
+
+    // ---- Transaction (MULTI/EXEC) state ----
+
+    /** Whether MULTI has been called (client is in transaction mode) */
+    private boolean inMulti = false;
+
+    /** Queued commands during a MULTI block */
+    private final List<byte[][]> txQueue = new ArrayList<>();
+
+    /** Whether the transaction was dirtied by a WATCH violation */
+    private boolean txDirty = false;
+
+    /** Keys being watched for this client */
+    private final Set<String> watchedKeys = new HashSet<>();
 
     public RedisClient(int fd) {
         this.fd = fd;

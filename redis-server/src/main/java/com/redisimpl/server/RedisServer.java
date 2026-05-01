@@ -8,13 +8,20 @@ import com.redisimpl.server.command.CommandEntry;
 import com.redisimpl.server.command.CommandTable;
 import com.redisimpl.server.command.RedisException;
 import com.redisimpl.server.commands.generic.GenericCommands;
+import com.redisimpl.server.commands.geo.GeoCommands;
 import com.redisimpl.server.commands.hash.HashCommands;
+import com.redisimpl.server.commands.hyperloglog.HyperLogLogCommands;
 import com.redisimpl.server.commands.list.ListCommands;
+import com.redisimpl.server.commands.pubsub.PubSubCommands;
+import com.redisimpl.server.commands.scripting.ScriptingCommands;
 import com.redisimpl.server.commands.server.ServerCommands;
 import com.redisimpl.server.commands.set.SetCommands;
+import com.redisimpl.server.commands.stream.StreamCommands;
 import com.redisimpl.server.commands.string.StringCommands;
+import com.redisimpl.server.commands.transaction.TransactionCommands;
 import com.redisimpl.server.commands.zset.ZSetCommands;
 import com.redisimpl.server.db.RedisDb;
+import com.redisimpl.server.pubsub.PubSubManager;
 import com.redisimpl.server.resp.RespDecoder;
 import com.redisimpl.server.resp.RespEncoder;
 import org.slf4j.Logger;
@@ -24,6 +31,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -66,6 +74,12 @@ public final class RedisServer {
     /** Keys being waited on by blocked clients: key → list of waiting clients */
     private final Map<String, List<RedisClient>> blockedKeys = new ConcurrentHashMap<>();
 
+    // ---- Pub/Sub ----
+    private final PubSubManager pubSubManager = new PubSubManager();
+
+    // ---- WATCH: key → set of watching clients ----
+    private final Map<String, Set<RedisClient>> watchedKeyClients = new ConcurrentHashMap<>();
+
     private ServerSocketChannel serverChannel;
     private volatile boolean running = false;
 
@@ -98,6 +112,13 @@ public final class RedisServer {
         commandTable.register(new ZSetCommands(this));
         commandTable.register(new GenericCommands(this));
         commandTable.register(new ServerCommands(this));
+        // Phase 3 commands
+        commandTable.register(new StreamCommands(this));
+        commandTable.register(new PubSubCommands(this, pubSubManager));
+        commandTable.register(new TransactionCommands(this));
+        commandTable.register(new ScriptingCommands(this));
+        commandTable.register(new HyperLogLogCommands(this));
+        commandTable.register(new GeoCommands(this));
     }
 
     // ---- Start/Stop ----
@@ -223,13 +244,13 @@ public final class RedisServer {
         byte[][] argv = client.getArgv();
         if (argv == null || argv.length == 0) return;
 
-        String cmdName = new String(argv[0]).toLowerCase();
+        String cmdName = new String(argv[0], StandardCharsets.UTF_8).toLowerCase();
         CommandEntry cmd = commandTable.lookup(cmdName);
 
         if (cmd == null) {
             client.addReply(RespEncoder.encodeError(
                     "ERR unknown command '" + cmdName + "', with args beginning with: "
-                            + (argv.length > 1 ? "'" + new String(argv[1]) + "'" : "")));
+                            + (argv.length > 1 ? "'" + new String(argv[1], StandardCharsets.UTF_8) + "'" : "")));
             return;
         }
 
@@ -239,11 +260,27 @@ public final class RedisServer {
             return;
         }
 
+        // If in MULTI, queue commands (except EXEC, DISCARD, MULTI, WATCH)
+        if (client.isInMulti()
+                && !cmdName.equals("exec")
+                && !cmdName.equals("discard")
+                && !cmdName.equals("multi")
+                && !cmdName.equals("watch")) {
+            client.getTxQueue().add(argv);
+            client.addReply(RespEncoder.encodeSimpleString("QUEUED"));
+            totalCommandsProcessed.incrementAndGet();
+            return;
+        }
+
         client.setCmd(cmd);
         try {
             byte[] reply = cmd.execute(client, argv);
             if (reply != null) {
                 client.addReply(reply);
+            }
+            // Notify WATCH observers if this is a write command
+            if (cmd.getFlags().contains("write")) {
+                notifyWatchedKeys(argv, client.getDb());
             }
         } catch (RedisException e) {
             client.addReply(RespEncoder.encodeError(e.getMessage()));
@@ -253,6 +290,64 @@ public final class RedisServer {
         }
 
         totalCommandsProcessed.incrementAndGet();
+    }
+
+    /**
+     * Execute a single command argv for a client and return the raw RESP reply.
+     * Used by EXEC to run queued commands.
+     */
+    public byte[] executeCommand(RedisClient client, byte[][] argv) {
+        String cmdName = new String(argv[0], StandardCharsets.UTF_8).toLowerCase();
+        CommandEntry cmd = commandTable.lookup(cmdName);
+        if (cmd == null) {
+            return RespEncoder.encodeError("ERR unknown command '" + cmdName + "'");
+        }
+        if (!cmd.isArityValid(argv.length)) {
+            return RespEncoder.encodeError("ERR wrong number of arguments for '" + cmdName + "' command");
+        }
+        try {
+            byte[] reply = cmd.execute(client, argv);
+            if (cmd.getFlags().contains("write")) {
+                notifyWatchedKeys(argv, client.getDb());
+            }
+            return reply != null ? reply : RespEncoder.NULL_BULK;
+        } catch (RedisException e) {
+            return RespEncoder.encodeError(e.getMessage());
+        } catch (Exception e) {
+            log.error("Command error in EXEC [{}]: {}", cmdName, e.getMessage(), e);
+            return RespEncoder.encodeError("ERR internal error");
+        }
+    }
+
+    // ---- WATCH support ----
+
+    public void registerWatch(RedisClient client, String key) {
+        watchedKeyClients
+            .computeIfAbsent(key, k -> Collections.newSetFromMap(new ConcurrentHashMap<>()))
+            .add(client);
+    }
+
+    public void unregisterWatches(RedisClient client) {
+        for (String key : client.getWatchedKeys()) {
+            Set<RedisClient> watchers = watchedKeyClients.get(key);
+            if (watchers != null) watchers.remove(client);
+        }
+    }
+
+    /** Called after any write command; marks watching clients as dirty. */
+    private void notifyWatchedKeys(byte[][] argv, int dbIndex) {
+        // Keys are at positions firstKey..lastKey (simplified: check all argv[1..])
+        for (int i = 1; i < argv.length; i++) {
+            String key = new String(argv[i], StandardCharsets.UTF_8);
+            Set<RedisClient> watchers = watchedKeyClients.get(key);
+            if (watchers != null) {
+                for (RedisClient watcher : watchers) {
+                    if (watcher.getDb() == dbIndex) {
+                        watcher.setTxDirty(true);
+                    }
+                }
+            }
+        }
     }
 
     // ---- Write ----
