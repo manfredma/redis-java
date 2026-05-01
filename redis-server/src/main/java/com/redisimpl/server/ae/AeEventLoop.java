@@ -77,7 +77,14 @@ public final class AeEventLoop {
         if ((mask & AE_WRITABLE) != 0) fe.wfileProc = proc;
 
         int interestOps = 0;
-        if ((fe.mask & AE_READABLE) != 0) interestOps |= SelectionKey.OP_READ;
+        if ((fe.mask & AE_READABLE) != 0) {
+            // ServerSocketChannel uses OP_ACCEPT; SocketChannel uses OP_READ
+            if (channel instanceof java.nio.channels.ServerSocketChannel) {
+                interestOps |= SelectionKey.OP_ACCEPT;
+            } else {
+                interestOps |= SelectionKey.OP_READ;
+            }
+        }
         if ((fe.mask & AE_WRITABLE) != 0) interestOps |= SelectionKey.OP_WRITE;
 
         SelectionKey key = channel.keyFor(selector);
@@ -104,7 +111,13 @@ public final class AeEventLoop {
                 fileEvents.remove(channel);
             } else {
                 int interestOps = 0;
-                if ((fe.mask & AE_READABLE) != 0) interestOps |= SelectionKey.OP_READ;
+                if ((fe.mask & AE_READABLE) != 0) {
+                    if (channel instanceof java.nio.channels.ServerSocketChannel) {
+                        interestOps |= SelectionKey.OP_ACCEPT;
+                    } else {
+                        interestOps |= SelectionKey.OP_READ;
+                    }
+                }
                 if ((fe.mask & AE_WRITABLE) != 0) interestOps |= SelectionKey.OP_WRITE;
                 key.interestOps(interestOps);
             }
@@ -191,7 +204,8 @@ public final class AeEventLoop {
             if (!key.isValid()) continue;
             FileEvent fe = (FileEvent) key.attachment();
             if (fe == null) continue;
-            if (key.isReadable() && fe.rfileProc != null) {
+            // isAcceptable counts as readable for ServerSocketChannel
+            if ((key.isReadable() || key.isAcceptable()) && fe.rfileProc != null) {
                 fe.rfileProc.process(this, fe.channel, AE_READABLE, fe.clientData);
             }
             if (key.isValid() && key.isWritable() && fe.wfileProc != null) {

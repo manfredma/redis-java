@@ -178,33 +178,27 @@ public final class RedisServer {
     private void readFromClient(AeEventLoop loop, SelectableChannel channel, int mask, Object data) {
         RedisClient client = (RedisClient) data;
         SocketChannel sc = (SocketChannel) channel;
-        ByteBuffer buf = ByteBuffer.allocate(4096);
+        ByteBuffer buf = ByteBuffer.allocate(16384);
 
         try {
             int nread = sc.read(buf);
             if (nread == -1) {
-                // Client disconnected
                 freeClient(client, sc);
                 return;
             }
             if (nread == 0) return;
 
             buf.flip();
-            byte[] bytes = new byte[buf.remaining()];
-            buf.get(bytes);
-            client.appendQueryBuf(bytes);
-
-            processInputBuffer(client);
+            // Pass only the newly-read bytes directly to the decoder
+            processInputBuffer(client, buf);
         } catch (IOException e) {
             freeClient(client, sc);
         }
     }
 
-    private void processInputBuffer(RedisClient client) {
+    private void processInputBuffer(RedisClient client, ByteBuffer newData) {
         RespDecoder decoder = getOrCreateDecoder(client);
-        byte[] queryBytes = client.getQuerybuf().toBytes();
-        List<byte[][]> commands = decoder.decode(ByteBuffer.wrap(queryBytes));
-        client.resetQueryBuf();
+        List<byte[][]> commands = decoder.decode(newData);
 
         for (byte[][] argv : commands) {
             if (argv.length == 0) continue;
@@ -216,10 +210,11 @@ public final class RedisServer {
         flushClient(client);
     }
 
-    private final Map<RedisClient, RespDecoder> decoders = new WeakHashMap<>();
+    private final Map<SocketChannel, RespDecoder> decoders = new HashMap<>();
 
     private RespDecoder getOrCreateDecoder(RedisClient client) {
-        return decoders.computeIfAbsent(client, k -> new RespDecoder());
+        SocketChannel sc = client.getChannel();
+        return decoders.computeIfAbsent(sc, k -> new RespDecoder());
     }
 
     // ---- Command dispatch ----
@@ -287,7 +282,7 @@ public final class RedisServer {
             sc.close();
         } catch (IOException ignored) {}
         clients.remove(sc);
-        decoders.remove(client);
+        decoders.remove(sc);
         log.debug("Client disconnected: fd={}", client.getFd());
     }
 
