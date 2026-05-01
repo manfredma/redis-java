@@ -1,0 +1,338 @@
+package com.redisimpl.server;
+
+import com.redisimpl.server.ae.AeEventLoop;
+import com.redisimpl.server.ae.AeFileProc;
+import com.redisimpl.server.bio.BioThread;
+import com.redisimpl.server.client.RedisClient;
+import com.redisimpl.server.command.CommandEntry;
+import com.redisimpl.server.command.CommandTable;
+import com.redisimpl.server.command.RedisException;
+import com.redisimpl.server.commands.generic.GenericCommands;
+import com.redisimpl.server.commands.hash.HashCommands;
+import com.redisimpl.server.commands.list.ListCommands;
+import com.redisimpl.server.commands.server.ServerCommands;
+import com.redisimpl.server.commands.set.SetCommands;
+import com.redisimpl.server.commands.string.StringCommands;
+import com.redisimpl.server.commands.zset.ZSetCommands;
+import com.redisimpl.server.db.RedisDb;
+import com.redisimpl.server.resp.RespDecoder;
+import com.redisimpl.server.resp.RespEncoder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * RedisServer — the main server class.
+ *
+ * <p>Manages:
+ * <ul>
+ *   <li>TCP accept loop (NIO)</li>
+ *   <li>Client read/write via AeEventLoop</li>
+ *   <li>Command dispatch</li>
+ *   <li>Multiple databases</li>
+ *   <li>serverCron (every 100ms)</li>
+ * </ul>
+ */
+public final class RedisServer {
+
+    private static final Logger log = LoggerFactory.getLogger(RedisServer.class);
+
+    public static final int DEFAULT_PORT = 6399;
+    public static final int DEFAULT_DATABASES = 16;
+    public static final int ACTIVE_EXPIRE_SAMPLE = 20;
+
+    // ---- Configuration ----
+    private final int port;
+    private final String bindAddr;
+    private final int numDatabases;
+
+    // ---- Runtime state ----
+    private final AeEventLoop eventLoop;
+    private final CommandTable commandTable;
+    private final RedisDb[] dbs;
+    private final Map<SocketChannel, RedisClient> clients = new ConcurrentHashMap<>();
+    private final AtomicLong totalCommandsProcessed = new AtomicLong(0);
+    private final AtomicLong totalConnectionsReceived = new AtomicLong(0);
+    private final long startTime = System.currentTimeMillis();
+
+    // ---- Blocking operations ----
+    /** Keys being waited on by blocked clients: key → list of waiting clients */
+    private final Map<String, List<RedisClient>> blockedKeys = new ConcurrentHashMap<>();
+
+    private ServerSocketChannel serverChannel;
+    private volatile boolean running = false;
+
+    public RedisServer() throws IOException {
+        this(DEFAULT_PORT);
+    }
+
+    public RedisServer(int port) throws IOException {
+        this(port, "127.0.0.1", DEFAULT_DATABASES);
+    }
+
+    public RedisServer(int port, String bindAddr, int numDatabases) throws IOException {
+        this.port = port;
+        this.bindAddr = bindAddr;
+        this.numDatabases = numDatabases;
+        this.eventLoop = new AeEventLoop();
+        this.dbs = new RedisDb[numDatabases];
+        for (int i = 0; i < numDatabases; i++) {
+            dbs[i] = new RedisDb(i);
+        }
+        this.commandTable = new CommandTable();
+        registerCommands();
+    }
+
+    private void registerCommands() {
+        commandTable.register(new StringCommands(this));
+        commandTable.register(new ListCommands(this));
+        commandTable.register(new HashCommands(this));
+        commandTable.register(new SetCommands(this));
+        commandTable.register(new ZSetCommands(this));
+        commandTable.register(new GenericCommands(this));
+        commandTable.register(new ServerCommands(this));
+    }
+
+    // ---- Start/Stop ----
+
+    public void start() throws IOException {
+        // Open server socket
+        serverChannel = ServerSocketChannel.open();
+        serverChannel.configureBlocking(false);
+        serverChannel.socket().setReuseAddress(true);
+        serverChannel.bind(new InetSocketAddress(bindAddr, port));
+
+        // Register accept handler
+        eventLoop.aeCreateFileEvent(serverChannel, AeEventLoop.AE_READABLE,
+                this::acceptClient, null);
+
+        // Register serverCron
+        eventLoop.aeCreateTimeEvent(100, (id, data) -> {
+            serverCron();
+            return 100; // repeat every 100ms
+        });
+
+        // Start BIO threads
+        BioThread.BioManager.getInstance().start();
+
+        running = true;
+        log.info("Redis server started on {}:{}", bindAddr, port);
+
+        // Run event loop (blocks until stop())
+        eventLoop.aeMain();
+    }
+
+    public void stop() {
+        running = false;
+        eventLoop.aeStop();
+        BioThread.BioManager.getInstance().stop();
+        try {
+            if (serverChannel != null) serverChannel.close();
+        } catch (IOException e) {
+            log.error("Error closing server channel", e);
+        }
+        // Close all client connections
+        for (SocketChannel ch : clients.keySet()) {
+            try { ch.close(); } catch (IOException ignored) {}
+        }
+        clients.clear();
+        eventLoop.close();
+        log.info("Redis server stopped");
+    }
+
+    // ---- Accept ----
+
+    private void acceptClient(AeEventLoop loop, SelectableChannel channel, int mask, Object data) {
+        try {
+            ServerSocketChannel ssc = (ServerSocketChannel) channel;
+            SocketChannel clientChannel = ssc.accept();
+            if (clientChannel == null) return;
+            clientChannel.configureBlocking(false);
+            clientChannel.socket().setTcpNoDelay(true);
+
+            int fd = System.identityHashCode(clientChannel);
+            RedisClient client = new RedisClient(fd);
+            client.setChannel(clientChannel);
+            clients.put(clientChannel, client);
+            totalConnectionsReceived.incrementAndGet();
+
+            // Register read handler
+            eventLoop.aeCreateFileEvent(clientChannel, AeEventLoop.AE_READABLE,
+                    this::readFromClient, client);
+
+            log.debug("New client connected: fd={}", fd);
+        } catch (IOException e) {
+            log.error("Error accepting client", e);
+        }
+    }
+
+    // ---- Read ----
+
+    private void readFromClient(AeEventLoop loop, SelectableChannel channel, int mask, Object data) {
+        RedisClient client = (RedisClient) data;
+        SocketChannel sc = (SocketChannel) channel;
+        ByteBuffer buf = ByteBuffer.allocate(4096);
+
+        try {
+            int nread = sc.read(buf);
+            if (nread == -1) {
+                // Client disconnected
+                freeClient(client, sc);
+                return;
+            }
+            if (nread == 0) return;
+
+            buf.flip();
+            byte[] bytes = new byte[buf.remaining()];
+            buf.get(bytes);
+            client.appendQueryBuf(bytes);
+
+            processInputBuffer(client);
+        } catch (IOException e) {
+            freeClient(client, sc);
+        }
+    }
+
+    private void processInputBuffer(RedisClient client) {
+        RespDecoder decoder = getOrCreateDecoder(client);
+        byte[] queryBytes = client.getQuerybuf().toBytes();
+        List<byte[][]> commands = decoder.decode(ByteBuffer.wrap(queryBytes));
+        client.resetQueryBuf();
+
+        for (byte[][] argv : commands) {
+            if (argv.length == 0) continue;
+            client.setArgv(argv);
+            processCommand(client);
+        }
+
+        // Send any pending output
+        flushClient(client);
+    }
+
+    private final Map<RedisClient, RespDecoder> decoders = new WeakHashMap<>();
+
+    private RespDecoder getOrCreateDecoder(RedisClient client) {
+        return decoders.computeIfAbsent(client, k -> new RespDecoder());
+    }
+
+    // ---- Command dispatch ----
+
+    public void processCommand(RedisClient client) {
+        byte[][] argv = client.getArgv();
+        if (argv == null || argv.length == 0) return;
+
+        String cmdName = new String(argv[0]).toLowerCase();
+        CommandEntry cmd = commandTable.lookup(cmdName);
+
+        if (cmd == null) {
+            client.addReply(RespEncoder.encodeError(
+                    "ERR unknown command '" + cmdName + "', with args beginning with: "
+                            + (argv.length > 1 ? "'" + new String(argv[1]) + "'" : "")));
+            return;
+        }
+
+        if (!cmd.isArityValid(argv.length)) {
+            client.addReply(RespEncoder.encodeError(
+                    "ERR wrong number of arguments for '" + cmdName + "' command"));
+            return;
+        }
+
+        client.setCmd(cmd);
+        try {
+            byte[] reply = cmd.execute(client, argv);
+            if (reply != null) {
+                client.addReply(reply);
+            }
+        } catch (RedisException e) {
+            client.addReply(RespEncoder.encodeError(e.getMessage()));
+        } catch (Exception e) {
+            log.error("Command error [{}]: {}", cmdName, e.getMessage(), e);
+            client.addReply(RespEncoder.encodeError("ERR internal error"));
+        }
+
+        totalCommandsProcessed.incrementAndGet();
+    }
+
+    // ---- Write ----
+
+    private void flushClient(RedisClient client) {
+        if (!client.hasPendingOutput()) return;
+        SocketChannel sc = client.getChannel();
+        if (sc == null || !sc.isOpen()) return;
+
+        try {
+            byte[] output = client.getPendingOutput();
+            ByteBuffer buf = ByteBuffer.wrap(output);
+            while (buf.hasRemaining()) {
+                sc.write(buf);
+            }
+            client.resetOutputBuffers();
+        } catch (IOException e) {
+            freeClient(client, sc);
+        }
+    }
+
+    // ---- Client cleanup ----
+
+    private void freeClient(RedisClient client, SocketChannel sc) {
+        try {
+            eventLoop.aeDeleteFileEvent(sc, AeEventLoop.AE_READABLE | AeEventLoop.AE_WRITABLE);
+            sc.close();
+        } catch (IOException ignored) {}
+        clients.remove(sc);
+        decoders.remove(client);
+        log.debug("Client disconnected: fd={}", client.getFd());
+    }
+
+    // ---- serverCron ----
+
+    private void serverCron() {
+        // Active expiry: sample 20 keys per DB
+        for (RedisDb db : dbs) {
+            db.activeExpireCycle(ACTIVE_EXPIRE_SAMPLE);
+        }
+    }
+
+    // ---- Accessors ----
+
+    public RedisDb getDb(int index) {
+        if (index < 0 || index >= dbs.length) {
+            throw RedisException.dbIndex();
+        }
+        return dbs[index];
+    }
+
+    public RedisDb[] getDbs() { return dbs; }
+    public int getNumDatabases() { return numDatabases; }
+    public CommandTable getCommandTable() { return commandTable; }
+    public long getTotalCommandsProcessed() { return totalCommandsProcessed.get(); }
+    public long getTotalConnectionsReceived() { return totalConnectionsReceived.get(); }
+    public long getStartTime() { return startTime; }
+    public int getPort() { return port; }
+    public int getConnectedClients() { return clients.size(); }
+    public Map<String, List<RedisClient>> getBlockedKeys() { return blockedKeys; }
+
+    // ---- Main ----
+
+    public static void main(String[] args) throws IOException {
+        int port = DEFAULT_PORT;
+        if (args.length > 0) {
+            try {
+                port = Integer.parseInt(args[0]);
+            } catch (NumberFormatException e) {
+                System.err.println("Invalid port: " + args[0]);
+                System.exit(1);
+            }
+        }
+        RedisServer server = new RedisServer(port);
+        Runtime.getRuntime().addShutdownHook(new Thread(server::stop));
+        server.start();
+    }
+}
