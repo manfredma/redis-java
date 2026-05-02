@@ -121,6 +121,12 @@ public final class RedisDb {
      * Get all keys matching a pattern (KEYS command).
      * Pattern uses Redis glob syntax: *, ?, [abc], [a-z]
      */
+    public List<byte[]> allKeys() {
+        List<byte[]> result = new ArrayList<>();
+        for (Dict.Entry entry : dict) result.add(entry.getKey());
+        return result;
+    }
+
     public List<byte[]> keys(String pattern) {
         List<byte[]> result = new ArrayList<>();
         for (Dict.Entry entry : dict) {

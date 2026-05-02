@@ -277,6 +277,15 @@ public final class RedisServer {
             return;
         }
 
+        // Cluster slot check: for commands with a key argument, verify we own the slot
+        if (clusterSlotChecker != null && cmd.getFirstKey() >= 1 && argv.length > cmd.getFirstKey()) {
+            byte[] movedError = clusterSlotChecker.check(argv);
+            if (movedError != null) {
+                client.addReply(movedError);
+                return;
+            }
+        }
+
         client.setCmd(cmd);
         try {
             byte[] reply = cmd.execute(client, argv);
@@ -417,6 +426,13 @@ public final class RedisServer {
     public int getPort() { return port; }
     public int getConnectedClients() { return clients.size(); }
     public Map<String, List<RedisClient>> getBlockedKeys() { return blockedKeys; }
+
+    // ---- Cluster ----
+    private volatile com.redisimpl.server.cluster.ClusterSlotChecker clusterSlotChecker;
+
+    public void setClusterSlotChecker(com.redisimpl.server.cluster.ClusterSlotChecker c) {
+        this.clusterSlotChecker = c;
+    }
 
     // ---- Replication ----
     public void setReplicationPropagator(
