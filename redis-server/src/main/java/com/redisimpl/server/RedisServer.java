@@ -80,6 +80,11 @@ public final class RedisServer {
     // ---- WATCH: key → set of watching clients ----
     private final Map<String, Set<RedisClient>> watchedKeyClients = new ConcurrentHashMap<>();
 
+    // ---- Replication ----
+    private volatile com.redisimpl.server.replication.ReplicationPropagator replicationPropagator;
+    private final com.redisimpl.server.replication.ReplicationInfo replicationInfo =
+            new com.redisimpl.server.replication.ReplicationInfo();
+
     private ServerSocketChannel serverChannel;
     private volatile boolean running = false;
 
@@ -281,6 +286,10 @@ public final class RedisServer {
             // Notify WATCH observers if this is a write command
             if (cmd.getFlags().contains("write")) {
                 notifyWatchedKeys(argv, client.getDb());
+                // Propagate write command to replicas
+                if (replicationPropagator != null) {
+                    replicationPropagator.propagate(argv);
+                }
             }
         } catch (RedisException e) {
             client.addReply(RespEncoder.encodeError(e.getMessage()));
@@ -408,6 +417,17 @@ public final class RedisServer {
     public int getPort() { return port; }
     public int getConnectedClients() { return clients.size(); }
     public Map<String, List<RedisClient>> getBlockedKeys() { return blockedKeys; }
+
+    // ---- Replication ----
+    public void setReplicationPropagator(
+            com.redisimpl.server.replication.ReplicationPropagator p) {
+        this.replicationPropagator = p;
+    }
+    public com.redisimpl.server.replication.ReplicationInfo getReplicationInfo() {
+        return replicationInfo;
+    }
+    public PubSubManager getPubSubManager() { return pubSubManager; }
+    public AeEventLoop getEventLoop() { return eventLoop; }
 
     // ---- Main ----
 

@@ -56,6 +56,17 @@ public final class RdbLoader {
         log.info("RDB loaded from {}", filePath);
     }
 
+    /**
+     * Load RDB from a raw byte array (used for replication full sync).
+     */
+    public void loadFromBytes(byte[] rdbData, RedisDb[] dbs) throws IOException {
+        validateCrc(rdbData);
+        DataInputStream in = new DataInputStream(
+                new BufferedInputStream(new ByteArrayInputStream(rdbData)));
+        readRdb(in, dbs);
+        log.info("RDB loaded from replication stream: {} bytes", rdbData.length);
+    }
+
     private void validateCrc(byte[] fileBytes) throws IOException {
         if (fileBytes.length < 9 + 9) { // magic + EOF + CRC
             throw new IOException("RDB file too short");
@@ -182,10 +193,15 @@ public final class RdbLoader {
                         val);
             } catch (NumberFormatException ignored) {}
         }
+        // Use Sds as ptr so StringCommands can cast to Sds correctly
+        com.redisimpl.core.sds.Sds sds = com.redisimpl.core.sds.Sds.fromBytes(bytes);
+        int encoding = bytes.length <= 44
+                ? RedisObjectConstants.OBJ_ENCODING_EMBSTR
+                : RedisObjectConstants.OBJ_ENCODING_RAW;
         return RedisObject.createObject(
                 RedisObjectConstants.OBJ_TYPE_STRING,
-                RedisObjectConstants.OBJ_ENCODING_RAW,
-                bytes);
+                encoding,
+                sds);
     }
 
     private RedisObject readListPlain(DataInputStream in) throws IOException {

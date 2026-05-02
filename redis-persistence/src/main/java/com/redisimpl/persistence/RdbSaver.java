@@ -129,6 +129,15 @@ public final class RdbSaver {
         return lastSaveTime.get();
     }
 
+    /**
+     * Serialize databases to an in-memory stream (used for replication full sync).
+     */
+    public void saveToStream(OutputStream outputStream, RedisDb[] dbs) throws IOException {
+        try (CrcOutputStream out = new CrcOutputStream(new BufferedOutputStream(outputStream))) {
+            writeRdb(out, dbs);
+        }
+    }
+
     // ---- Write logic ----
 
     private void writeRdb(CrcOutputStream out, RedisDb[] dbs) throws IOException {
@@ -230,7 +239,9 @@ public final class RdbSaver {
             writeRdbIntegerEncoding(out, val);
         } else {
             byte[] bytes;
-            if (obj.getPtr() instanceof byte[]) {
+            if (obj.getPtr() instanceof com.redisimpl.core.sds.Sds) {
+                bytes = ((com.redisimpl.core.sds.Sds) obj.getPtr()).toBytes();
+            } else if (obj.getPtr() instanceof byte[]) {
                 bytes = (byte[]) obj.getPtr();
             } else {
                 bytes = obj.getPtr().toString().getBytes(StandardCharsets.UTF_8);

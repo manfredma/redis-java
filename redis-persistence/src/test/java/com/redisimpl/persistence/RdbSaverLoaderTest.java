@@ -568,6 +568,7 @@ class RdbSaverLoaderTest {
 
     private static byte[] getStringBytes(RedisObject obj) {
         Object ptr = obj.getPtr();
+        if (ptr instanceof com.redisimpl.core.sds.Sds) return ((com.redisimpl.core.sds.Sds) ptr).toBytes();
         if (ptr instanceof byte[]) return (byte[]) ptr;
         if (ptr instanceof Long) return String.valueOf((Long) ptr).getBytes(StandardCharsets.UTF_8);
         return ptr.toString().getBytes(StandardCharsets.UTF_8);

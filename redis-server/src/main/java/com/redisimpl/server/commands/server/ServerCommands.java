@@ -39,6 +39,47 @@ public final class ServerCommands {
         return RespEncoder.encodeBulkString(argv[1]);
     }
 
+    // CLIENT subcommands — handles Jedis 5 connection initialization
+    @RedisCommand(name = "client", arity = -2, flags = "admin loading stale", firstKey = 0, lastKey = 0, step = 0)
+    public byte[] clientCmd(RedisClient client, byte[][] argv) {
+        String sub = toStr(argv[1]).toUpperCase();
+        switch (sub) {
+            case "SETNAME":
+                if (argv.length >= 3) client.setName(toStr(argv[2]));
+                return RespEncoder.OK;
+            case "GETNAME":
+                String name = client.getName();
+                return name == null || name.isEmpty()
+                        ? RespEncoder.NULL_BULK
+                        : RespEncoder.encodeBulkString(name.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            case "INFO":
+                String info = "id=" + client.getId() + " addr=127.0.0.1:0 laddr=127.0.0.1:" + server.getPort()
+                        + " fd=" + client.getFd() + " name=" + (client.getName() != null ? client.getName() : "")
+                        + " age=0 idle=0 flags=N db=" + client.getDb() + " sub=0 psub=0 ssub=0 multi=-1"
+                        + " watch=0 qbuf=0 qbuf-free=32768 argv-mem=0 multi-mem=0 tot-mem=0"
+                        + " rbs=16384 rbp=0 obl=0 oll=0 omem=0 events=r cmd=client|info"
+                        + " user=default library-name= library-ver=\n";
+                return RespEncoder.encodeBulkString(info.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            case "LIST":
+                return RespEncoder.encodeBulkString(("id=" + client.getId() + " addr=127.0.0.1:0 cmd=client\n")
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            case "ID":
+                return RespEncoder.encodeInteger(client.getId());
+            case "NO-EVICT":
+            case "NO-TOUCH":
+            case "CACHING":
+            case "UNPAUSE":
+            case "PAUSE":
+                return RespEncoder.OK;
+            case "KILL":
+                return RespEncoder.encodeInteger(0);
+            case "REPLY":
+                return RespEncoder.OK;
+            default:
+                return RespEncoder.encodeError("ERR unknown subcommand '" + sub + "'");
+        }
+    }
+
     @RedisCommand(name = "quit", arity = 1, flags = "fast allow-busy", firstKey = 0, lastKey = 0, step = 0)
     public byte[] quit(RedisClient client, byte[][] argv) {
         client.setFlags(client.getFlags() | RedisClient.CLIENT_CLOSE_AFTER_REPLY);
@@ -71,6 +112,31 @@ public final class ServerCommands {
         sb.append("\r\n# Stats\r\n");
         sb.append("total_commands_processed:").append(server.getTotalCommandsProcessed()).append("\r\n");
         sb.append("total_connections_received:").append(server.getTotalConnectionsReceived()).append("\r\n");
+        // Replication section
+        com.redisimpl.server.replication.ReplicationInfo ri = server.getReplicationInfo();
+        String section = argv.length > 1 ? toStr(argv[1]).toLowerCase() : "all";
+        if (section.equals("replication") || section.equals("all")) {
+            sb.append("\r\n# Replication\r\n");
+            if (ri.getRole() == com.redisimpl.server.replication.ReplicationInfo.Role.SLAVE) {
+                sb.append("role:slave\r\n");
+                sb.append("master_host:").append(ri.getMasterHost()).append("\r\n");
+                sb.append("master_port:").append(ri.getMasterPort()).append("\r\n");
+                sb.append("master_link_status:").append(ri.isMasterLinkUp() ? "up" : "down").append("\r\n");
+                sb.append("master_last_io_seconds_ago:0\r\n");
+                sb.append("master_sync_in_progress:0\r\n");
+                sb.append("slave_repl_offset:").append(ri.getReplicaOffset()).append("\r\n");
+            } else {
+                sb.append("role:master\r\n");
+                sb.append("connected_slaves:").append(ri.getConnectedSlaves()).append("\r\n");
+                sb.append("master_replid:").append(ri.getReplId()).append("\r\n");
+                sb.append("master_repl_offset:").append(ri.getMasterOffset()).append("\r\n");
+                sb.append("repl_backlog_active:0\r\n");
+                sb.append("repl_backlog_size:1048576\r\n");
+            }
+            if (section.equals("replication")) {
+                return RespEncoder.encodeBulkString(toBytes(sb.toString()));
+            }
+        }
         sb.append("\r\n# Keyspace\r\n");
         for (int i = 0; i < server.getNumDatabases(); i++) {
             int size = server.getDb(i).dbSize();

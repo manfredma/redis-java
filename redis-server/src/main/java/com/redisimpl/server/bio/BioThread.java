@@ -36,8 +36,10 @@ public final class BioThread {
         this.thread.setDaemon(true);
     }
 
-    public void start() {
-        thread.start();
+    public synchronized void start() {
+        if (thread.getState() == Thread.State.NEW) {
+            thread.start();
+        }
     }
 
     public void submit(Runnable task) {

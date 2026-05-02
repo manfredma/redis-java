@@ -17,6 +17,9 @@
         <module>redis-core</module>
         <module>redis-server</module>
         <module>redis-persistence</module>
+        <module>redis-replication</module>
+        <module>redis-sentinel</module>
+        <module>redis-cluster</module>
         <module>redis-test</module>
     </modules>
 
@@ -105,6 +108,12 @@
             <dependency>
                 <groupId>com.redisimpl</groupId>
                 <artifactId>redis-persistence</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <!-- redis-replication module -->
+            <dependency>
+                <groupId>com.redisimpl</groupId>
+                <artifactId>redis-replication</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

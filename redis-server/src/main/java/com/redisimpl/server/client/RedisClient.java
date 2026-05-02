@@ -96,6 +96,14 @@ public final class RedisClient {
     /** Keys being watched for this client */
     private final Set<String> watchedKeys = new HashSet<>();
 
+    /** Client name (set by CLIENT SETNAME) */
+    private String name;
+
+    /** Unique client ID */
+    private static final java.util.concurrent.atomic.AtomicLong ID_COUNTER =
+            new java.util.concurrent.atomic.AtomicLong(0);
+    private final long id = ID_COUNTER.incrementAndGet();
+
     public RedisClient(int fd) {
         this.fd = fd;
         this.querybuf = Sds.empty();
@@ -195,6 +203,11 @@ public final class RedisClient {
     public boolean hasPendingOutput() {
         return bufpos > 0 || !reply.isEmpty();
     }
+
+    public long getId()            { return id; }
+    public String getName()        { return name; }
+    public void setName(String n)  { this.name = n; }
+    public int getFd()             { return fd; }
 
     @Override
     public String toString() {
