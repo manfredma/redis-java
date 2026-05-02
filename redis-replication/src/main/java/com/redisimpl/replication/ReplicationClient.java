@@ -105,8 +105,8 @@ public final class ReplicationClient implements Runnable {
             connected = true;
             updateReplicationInfo(true);
 
-            // ---- Stream commands ----
-            streamCommands(in);
+            // ---- Stream commands (pass OutputStream for REPLCONF ACK replies) ----
+            streamCommands(in, out);
         } finally {
             connected = false;
             activeSocket = null;
@@ -143,7 +143,14 @@ public final class ReplicationClient implements Runnable {
         });
     }
 
-    private void streamCommands(InputStream in) throws IOException {
+    /**
+     * Stream incoming replication commands from master and execute them.
+     * Mirrors the replication stream processing loop in replication.c.
+     *
+     * @param in  input stream from master
+     * @param out output stream to master (for REPLCONF ACK replies)
+     */
+    private void streamCommands(InputStream in, OutputStream out) throws IOException {
         RespDecoder decoder = new RespDecoder();
         byte[] buf = new byte[16384];
 
@@ -158,22 +165,27 @@ public final class ReplicationClient implements Runnable {
                 if (argv.length == 0) continue;
                 String cmd = new String(argv[0], StandardCharsets.UTF_8).toLowerCase();
 
-                // REPLCONF GETACK — master is asking for our offset
+                // REPLCONF GETACK — master requests current replication offset.
+                // Mirrors replicationSendAck() in replication.c:
+                //   addReplyArrayLen(c, 3); "REPLCONF" "ACK" "<offset>"
                 if (cmd.equals("replconf") && argv.length >= 3
-                        && new String(argv[1]).equalsIgnoreCase("getack")) {
-                    // Send our current offset
-                    byte[] ack = encodeCommand(new String[]{"REPLCONF", "ACK",
-                            String.valueOf(replicaOffset.get())});
-                    in.mark(0); // not applicable but harmless
-                    // We need to write back — but we only have InputStream here.
-                    // This is handled externally; skip for now.
+                        && new String(argv[1], StandardCharsets.UTF_8).equalsIgnoreCase("getack")) {
+                    byte[] ack = encodeCommand(new String[]{
+                            "REPLCONF", "ACK", String.valueOf(replicaOffset.get())});
+                    try {
+                        out.write(ack);
+                        out.flush();
+                        log.debug("Sent REPLCONF ACK {} to master", replicaOffset.get());
+                    } catch (IOException e) {
+                        log.warn("Failed to send REPLCONF ACK: {}", e.getMessage());
+                    }
                     continue;
                 }
 
-                // Execute the command on the replica's server
+                // Execute the replicated command on replica's event loop thread
                 executeOnReplica(argv);
 
-                // Accumulate offset (approximate: count bytes of this command)
+                // Track accumulated offset (mirrors c->reploff in replication.c)
                 replicaOffset.addAndGet(encodeCommand(argv).length);
             }
         }

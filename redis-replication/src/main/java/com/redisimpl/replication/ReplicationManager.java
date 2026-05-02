@@ -73,7 +73,11 @@ public final class ReplicationManager
 
     /**
      * Build the full-sync response: +FULLRESYNC header + $len\r\n + RDB bytes.
-     * The entire response is returned as a single byte[] for the event loop to write.
+     *
+     * This implementation uses diskless replication (repl-diskless-sync = yes):
+     * the RDB is serialized directly into memory and piped to the replica socket
+     * without writing a temporary file to disk.
+     * Mirrors the diskless sync path in replication.c (rdbSaveToSlavesSockets).
      */
     public byte[] buildFullSyncResponse(SocketChannel ch) {
         ReplicaInfo replica = replicas.computeIfAbsent(ch, ReplicaInfo::new);
@@ -81,10 +85,13 @@ public final class ReplicationManager
             byte[] header = RespEncoder.encodeSimpleString(
                     "FULLRESYNC " + replId + " " + masterOffset.get());
 
+            // Diskless sync: serialize RDB to in-memory stream, no temp file
+            // Mirrors rdbSaveToSlavesSockets() in replication.c
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             RdbSaver saver = new RdbSaver(new RedisConfig());
             saver.saveToStream(baos, server.getDbs());
             byte[] rdbData = baos.toByteArray();
+            log.info("Full sync (diskless): {} bytes RDB in-memory", rdbData.length);
 
             String lenLine = "$" + rdbData.length + "\r\n";
 

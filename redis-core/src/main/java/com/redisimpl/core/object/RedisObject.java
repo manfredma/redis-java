@@ -67,6 +67,9 @@ public class RedisObject {
     /**
      * Increment reference count.
      */
+    /** Replace the internal pointer (used by lazy-free to allow GC to collect). */
+    public void setPtr(Object ptr) { this.ptr = ptr; }
+
     public void incrRefCount() {
         refcount++;
     }

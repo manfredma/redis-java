@@ -157,6 +157,21 @@ public final class AeEventLoop {
         selector.wakeup();
     }
 
+    // ---- Before/After Sleep hooks (mirrors aeSetBeforeSleepProc/aeSetAfterSleepProc) ----
+
+    @FunctionalInterface
+    public interface SleepProc {
+        void run(AeEventLoop el);
+    }
+
+    private volatile SleepProc beforeSleepProc;
+    private volatile SleepProc afterSleepProc;
+
+    /** Set callback invoked before each aeApiPoll() — mirrors aeSetBeforeSleepProc(). */
+    public void aeSetBeforeSleepProc(SleepProc proc) { this.beforeSleepProc = proc; }
+    /** Set callback invoked after each aeApiPoll() — mirrors aeSetAfterSleepProc(). */
+    public void aeSetAfterSleepProc(SleepProc proc) { this.afterSleepProc = proc; }
+
     // ---- Main Loop ----
 
     public void aeMain() {
@@ -173,18 +188,25 @@ public final class AeEventLoop {
 
     /**
      * Process pending file and time events.
+     * Mirrors aeProcessEvents() in ae.c with beforeSleep/afterSleep hooks.
      */
     public void aeProcessEvents() {
-        // Process pending operations
+        // Process pending operations (submitted via submit())
         Runnable op;
         while ((op = pendingOps.poll()) != null) {
             op.run();
         }
 
+        // ---- beforeSleep (mirrors call before aeApiPoll in ae.c) ----
+        SleepProc before = beforeSleepProc;
+        if (before != null) {
+            try { before.run(this); } catch (Exception e) { log.error("beforeSleep error", e); }
+        }
+
         // Calculate timeout: time until next time event
         long timeout = calculateTimeout();
 
-        // Wait for I/O events or timeout
+        // aeApiPoll — wait for I/O events or timeout
         try {
             if (timeout <= 0) {
                 selector.selectNow();
@@ -193,6 +215,12 @@ public final class AeEventLoop {
             }
         } catch (IOException e) {
             log.error("Selector error", e);
+        }
+
+        // ---- afterSleep (mirrors call after aeApiPoll in ae.c) ----
+        SleepProc after = afterSleepProc;
+        if (after != null) {
+            try { after.run(this); } catch (Exception e) { log.error("afterSleep error", e); }
         }
 
         // Process file events
@@ -204,7 +232,6 @@ public final class AeEventLoop {
             if (!key.isValid()) continue;
             FileEvent fe = (FileEvent) key.attachment();
             if (fe == null) continue;
-            // isAcceptable counts as readable for ServerSocketChannel
             if ((key.isReadable() || key.isAcceptable()) && fe.rfileProc != null) {
                 fe.rfileProc.process(this, fe.channel, AE_READABLE, fe.clientData);
             }

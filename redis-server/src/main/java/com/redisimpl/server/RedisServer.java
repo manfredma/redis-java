@@ -148,6 +148,10 @@ public final class RedisServer {
         // Start BIO threads
         BioThread.BioManager.getInstance().start();
 
+        // Register beforeSleep — mirrors server.c:beforeSleep()
+        // Key responsibilities: flush pending client output buffers, fast active-expire
+        eventLoop.aeSetBeforeSleepProc(el -> beforeSleep());
+
         running = true;
         log.info("Redis server started on {}:{}", bindAddr, port);
 
@@ -402,9 +406,39 @@ public final class RedisServer {
     // ---- serverCron ----
 
     private void serverCron() {
-        // Active expiry: sample 20 keys per DB
+        // Active expiry: slow cycle — sample 20 keys per DB (mirrors activeExpireCycle SLOW)
         for (RedisDb db : dbs) {
             db.activeExpireCycle(ACTIVE_EXPIRE_SAMPLE);
+        }
+    }
+
+    // ---- beforeSleep (mirrors server.c beforeSleep()) ----
+
+    /**
+     * Called before each aeApiPoll() — mirrors beforeSleep() in server.c.
+     *
+     * Key responsibilities:
+     * 1. Flush pending client output buffers (handleClientsWithPendingWrites)
+     * 2. Fast active-expire cycle (ACTIVE_EXPIRE_CYCLE_FAST)
+     * 3. Flush AOF buffer if applicable
+     */
+    private void beforeSleep() {
+        // 1. Flush all pending client output (mirrors handleClientsWithPendingWrites)
+        for (Map.Entry<SocketChannel, RedisClient> entry : clients.entrySet()) {
+            RedisClient client = entry.getValue();
+            if (client.hasPendingOutput()) {
+                try {
+                    flushClient(client);
+                } catch (Exception e) {
+                    log.debug("Error flushing client in beforeSleep: {}", e.getMessage());
+                }
+            }
+        }
+
+        // 2. Fast active-expire cycle: sample 5 keys per DB (lighter than slow cycle)
+        // Mirrors activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST) in server.c
+        for (RedisDb db : dbs) {
+            db.activeExpireCycle(5);
         }
     }
 

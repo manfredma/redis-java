@@ -105,9 +105,82 @@ public final class RedisDb {
     /**
      * Delete a key and its expiry.
      */
+    /**
+     * Synchronous delete — mirrors dbDelete() / dbSyncDelete() in db.c.
+     * Always frees the value on the calling thread.
+     */
     public boolean delete(byte[] key) {
         expires.delete(key);
         return dict.delete(key);
+    }
+
+    /**
+     * Asynchronous delete — mirrors dbAsyncDelete() / UNLINK in db.c + lazyfree.c.
+     *
+     * Immediately removes the key from the keyspace but defers freeing the value
+     * object to the BIO lazy-free thread when the collection is large enough.
+     *
+     * Free-effort threshold = 64 elements, mirroring LAZYFREE_THRESHOLD in lazyfree.c:
+     *   - List (QuickList): node count
+     *   - Hash/Set (Dict): entry count
+     *   - ZSet (skiplist): node count
+     *   - Everything else: effort = 1 (free synchronously)
+     */
+    public boolean asyncDelete(byte[] key) {
+        expires.delete(key);
+        RedisObject obj = (RedisObject) dict.get(key);
+        if (obj == null) return false;
+
+        // Remove from dict first (key is no longer accessible)
+        dict.delete(key);
+
+        // Decide whether to free asynchronously (mirrors lazyfreeGetFreeEffort + freeObjAsync)
+        long effort = getLazyfreeEffort(obj);
+        if (effort > 64) {
+            // Submit to BIO lazy-free thread — mirrors bioCreateLazyFreeJob(lazyfreeFreeObject)
+            final RedisObject captured = obj;
+            com.redisimpl.server.bio.BioThread.BioManager.getInstance()
+                    .submitLazyFree(() -> {
+                        // In Java, GC handles memory; we just need to clear references
+                        // This mirrors the pattern of deferring decrRefCount to BIO thread
+                        captured.setPtr(null); // allow GC to collect the value
+                    });
+        }
+        // Small objects freed immediately (GC handles it naturally in Java)
+        return true;
+    }
+
+    /**
+     * Estimate free-effort for a RedisObject — mirrors lazyfreeGetFreeEffort() in lazyfree.c.
+     *
+     * Returns approximate number of allocations that need to be freed:
+     *   - QuickList: number of nodes (ql.len)
+     *   - Dict-encoded Hash/Set: number of entries
+     *   - Skiplist-encoded ZSet: skiplist length
+     *   - Everything else: 1
+     */
+    private static long getLazyfreeEffort(RedisObject obj) {
+        int type = obj.getType();
+        int enc  = obj.getEncoding();
+        Object ptr = obj.getPtr();
+        if (ptr == null) return 1;
+
+        if (type == com.redisimpl.core.object.RedisObjectConstants.OBJ_TYPE_LIST
+                && enc == com.redisimpl.core.object.RedisObjectConstants.OBJ_ENCODING_QUICKLIST) {
+            return ((com.redisimpl.core.quicklist.QuickList) ptr).llen();
+        }
+        if ((type == com.redisimpl.core.object.RedisObjectConstants.OBJ_TYPE_SET
+                || type == com.redisimpl.core.object.RedisObjectConstants.OBJ_TYPE_HASH)
+                && enc == com.redisimpl.core.object.RedisObjectConstants.OBJ_ENCODING_HT) {
+            return ((com.redisimpl.core.dict.Dict) ptr).size();
+        }
+        if (type == com.redisimpl.core.object.RedisObjectConstants.OBJ_TYPE_ZSET
+                && enc == com.redisimpl.core.object.RedisObjectConstants.OBJ_ENCODING_SKIPLIST) {
+            com.redisimpl.server.commands.zset.ZSetCommands.ZSetData data =
+                    (com.redisimpl.server.commands.zset.ZSetCommands.ZSetData) ptr;
+            return data.zsl.length();
+        }
+        return 1;
     }
 
     /**
@@ -215,22 +288,63 @@ public final class RedisDb {
      * Perform active expiry: randomly sample up to {@code count} keys and delete expired ones.
      * Returns the number of keys deleted.
      */
-    public int activeExpireCycle(int count) {
-        Set<byte[]> keySet = expires.keySet();
-        if (keySet.isEmpty()) return 0;
-        List<byte[]> sample = new ArrayList<>(keySet);
-        // Shuffle and take up to count
-        Collections.shuffle(sample);
-        int deleted = 0;
-        for (int i = 0; i < Math.min(count, sample.size()); i++) {
-            byte[] key = sample.get(i);
-            if (isExpired(key)) {
+    /**
+     * Active expiry cycle — mirrors activeExpireCycle() in expire.c.
+     *
+     * Tiered adaptive algorithm:
+     *   1. Sample {@code keysPerLoop} keys from the expires dict using dictScan cursor.
+     *   2. Delete all expired keys found.
+     *   3. Repeat if expired-ratio > ACCEPTABLE_STALE (10%), up to a time limit.
+     *
+     * The scan cursor is persisted across calls so we don't always start from slot 0,
+     * mirroring how Redis uses db->expires_cursor for fair distribution across dbs.
+     *
+     * @param keysPerLoop  max keys to sample per outer iteration (20 for slow, 5 for fast)
+     */
+    public int activeExpireCycle(int keysPerLoop) {
+        if (expires.size() == 0) return 0;
+
+        // ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE = 10 (%)
+        final int ACCEPTABLE_STALE = 10;
+        // Limit total work to avoid blocking: max 16 inner iterations
+        final int MAX_ITERATIONS = 16;
+
+        long now = System.currentTimeMillis();
+        int totalDeleted = 0;
+        int iteration = 0;
+
+        do {
+            int sampled = 0;
+            int expired = 0;
+
+            // Use dictScan cursor for fair scan across hash buckets
+            final List<byte[]> expiredKeys = new ArrayList<>();
+            expiresCursor = expires.scan(expiresCursor, (key, value) -> {
+                Long expireAt = (Long) value;
+                if (expireAt != null && now >= expireAt) {
+                    expiredKeys.add(key);
+                }
+            });
+            sampled += keysPerLoop; // approximate
+
+            for (byte[] key : expiredKeys) {
                 delete(key);
-                deleted++;
+                expired++;
             }
-        }
-        return deleted;
+            totalDeleted += expired;
+
+            iteration++;
+            // Continue if high stale ratio and not exceeded iteration limit
+            // Mirrors: repeat = (expired*100/sampled) > ACCEPTABLE_STALE
+            if (sampled == 0 || expiresCursor == 0) break;
+            if (expired * 100 / Math.max(sampled, 1) <= ACCEPTABLE_STALE) break;
+        } while (iteration < MAX_ITERATIONS);
+
+        return totalDeleted;
     }
+
+    /** Persistent scan cursor for active expiry (mirrors db->expires_cursor in Redis). */
+    private long expiresCursor = 0;
 
     // ---- Scan ----
 

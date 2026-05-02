@@ -331,7 +331,6 @@ public final class HashCommands {
 
         List<Object> result = new ArrayList<>();
         if (count >= 0) {
-            // Distinct
             List<byte[]> shuffled = new ArrayList<>(keys);
             Collections.shuffle(shuffled);
             for (int i = 0; i < Math.min(count, shuffled.size()); i++) {
@@ -339,13 +338,281 @@ public final class HashCommands {
                 if (withValues) result.add(hashGet(obj, shuffled.get(i)));
             }
         } else {
-            // Allow duplicates
             for (int i = 0; i < -count; i++) {
                 byte[] k = keys.get(new Random().nextInt(keys.size()));
                 result.add(k);
                 if (withValues) result.add(hashGet(obj, k));
             }
         }
+        return RespEncoder.encodeArray(result);
+    }
+
+    // ---- Hash field TTL commands (Redis 7.4+, mirrors t_hash.c) ----
+    // Return codes (mirrors HFE_GET_* / HSETEX_* constants in t_hash.h):
+    //   -2 = field does not exist
+    //   -1 = field exists but has no TTL (persistent)
+    //    0 = field already expired (treat as not-exist)
+    //   >0 = TTL value
+
+    private static final long HFE_NO_FIELD = -2;
+    private static final long HFE_NO_TTL   = -1;
+
+    // Per-field TTL storage: key → (field → expireAtMs)
+    // This mirrors the listpack_ex / hash-field-expiry mechanism in Redis 7.4.
+    // We store it as a separate map associated with the RedisObject via its identity.
+    private static final java.util.concurrent.ConcurrentHashMap<
+            Integer, Map<String, Long>> fieldExpiries = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static Map<String, Long> getFieldExpiries(RedisObject obj) {
+        return fieldExpiries.computeIfAbsent(System.identityHashCode(obj),
+                k -> new java.util.concurrent.ConcurrentHashMap<>());
+    }
+
+    private static void removeFieldExpiries(RedisObject obj) {
+        fieldExpiries.remove(System.identityHashCode(obj));
+    }
+
+    /**
+     * HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
+     *
+     * Set TTL (in seconds) on one or more hash fields.
+     * Mirrors hexpireCommand() → hexpireGenericCommand() in t_hash.c.
+     *
+     * Options:
+     *   NX: Set only if field has no expiry
+     *   XX: Set only if field already has expiry
+     *   GT: Set only if new expiry > current
+     *   LT: Set only if new expiry < current
+     *
+     * Return array of per-field result codes:
+     *   -2 field does not exist
+     *    0 condition not met (NX/XX/GT/LT)
+     *    1 TTL set
+     *    2 field deleted (TTL in the past)
+     */
+    @RedisCommand(name = "hexpire", arity = -6, flags = "write fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hexpire(RedisClient client, byte[][] argv) {
+        return hexpireGeneric(client, argv, false, false);
+    }
+
+    /** HPEXPIRE key milliseconds [NX|XX|GT|LT] FIELDS numfields field [...] */
+    @RedisCommand(name = "hpexpire", arity = -6, flags = "write fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hpexpire(RedisClient client, byte[][] argv) {
+        return hexpireGeneric(client, argv, true, false);
+    }
+
+    /** HEXPIREAT key unix-time-seconds [NX|XX|GT|LT] FIELDS numfields field [...] */
+    @RedisCommand(name = "hexpireat", arity = -6, flags = "write fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hexpireat(RedisClient client, byte[][] argv) {
+        return hexpireGeneric(client, argv, false, true);
+    }
+
+    /** HPEXPIREAT key unix-time-ms [NX|XX|GT|LT] FIELDS numfields field [...] */
+    @RedisCommand(name = "hpexpireat", arity = -6, flags = "write fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hpexpireat(RedisClient client, byte[][] argv) {
+        return hexpireGeneric(client, argv, true, true);
+    }
+
+    private byte[] hexpireGeneric(RedisClient client, byte[][] argv,
+                                   boolean millis, boolean absolute) {
+        RedisDb db = db(client);
+        RedisObject obj = db.lookupKeyOrReply(argv[1], RedisObjectConstants.OBJ_TYPE_HASH);
+
+        // Parse: argv[2]=time, optional condition flag, then FIELDS numfields field...
+        long rawTime;
+        try { rawTime = Long.parseLong(toStr(argv[2])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+
+        // Detect optional NX/XX/GT/LT flag
+        int fieldsIdx = 3;
+        String condition = null;
+        String argAtIdx3 = argv.length > 3 ? toStr(argv[3]).toUpperCase() : "";
+        if (argAtIdx3.equals("NX") || argAtIdx3.equals("XX") ||
+                argAtIdx3.equals("GT") || argAtIdx3.equals("LT")) {
+            condition = argAtIdx3;
+            fieldsIdx = 4;
+        }
+
+        if (argv.length <= fieldsIdx + 1 || !toStr(argv[fieldsIdx]).equalsIgnoreCase("FIELDS"))
+            throw RedisException.syntax();
+
+        int numFields;
+        try { numFields = Integer.parseInt(toStr(argv[fieldsIdx + 1])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+
+        if (numFields <= 0) throw new RedisException("ERR Number of fields must be a positive integer");
+        if (argv.length < fieldsIdx + 2 + numFields) throw RedisException.syntax();
+
+        // Compute absolute expiry in ms
+        long now = System.currentTimeMillis();
+        long expireAtMs;
+        if (absolute) {
+            expireAtMs = millis ? rawTime : rawTime * 1000L;
+        } else {
+            expireAtMs = now + (millis ? rawTime : rawTime * 1000L);
+        }
+
+        List<Object> result = new ArrayList<>();
+
+        if (obj == null) {
+            for (int i = 0; i < numFields; i++) result.add(HFE_NO_FIELD);
+            return RespEncoder.encodeArray(result);
+        }
+
+        Map<String, Long> expiries = getFieldExpiries(obj);
+
+        for (int i = 0; i < numFields; i++) {
+            String field = toStr(argv[fieldsIdx + 2 + i]);
+            if (hashGet(obj, toBytes(field)) == null) {
+                result.add(HFE_NO_FIELD);
+                continue;
+            }
+
+            // Check expiry in the past → delete field
+            if (expireAtMs <= now) {
+                hashDel(obj, toBytes(field));
+                expiries.remove(field);
+                if (hashLen(obj) == 0) { db.delete(argv[1]); removeFieldExpiries(obj); }
+                result.add(2L); // deleted
+                continue;
+            }
+
+            Long current = expiries.get(field);
+            // Apply condition
+            if (condition != null) {
+                switch (condition) {
+                    case "NX": if (current != null) { result.add(0L); continue; } break;
+                    case "XX": if (current == null) { result.add(0L); continue; } break;
+                    case "GT": if (current != null && expireAtMs <= current) { result.add(0L); continue; } break;
+                    case "LT": if (current != null && expireAtMs >= current) { result.add(0L); continue; } break;
+                }
+            }
+
+            expiries.put(field, expireAtMs);
+            result.add(1L); // set
+        }
+
+        return RespEncoder.encodeArray(result);
+    }
+
+    /**
+     * HTTL key FIELDS numfields field [field ...]
+     *
+     * Returns remaining TTL in seconds for each field.
+     * Mirrors httlCommand() → httlGenericCommand() in t_hash.c.
+     */
+    @RedisCommand(name = "httl", arity = -5, flags = "read-only fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] httl(RedisClient client, byte[][] argv) {
+        return httlGeneric(client, argv, false, false);
+    }
+
+    /** HPTTL key FIELDS numfields field [...] — returns TTL in ms */
+    @RedisCommand(name = "hpttl", arity = -5, flags = "read-only fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hpttl(RedisClient client, byte[][] argv) {
+        return httlGeneric(client, argv, true, false);
+    }
+
+    /** HEXPIRETIME key FIELDS numfields field [...] — returns absolute expiry in seconds */
+    @RedisCommand(name = "hexpiretime", arity = -5, flags = "read-only fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hexpiretime(RedisClient client, byte[][] argv) {
+        return httlGeneric(client, argv, false, true);
+    }
+
+    /** HPEXPIRETIME key FIELDS numfields field [...] — returns absolute expiry in ms */
+    @RedisCommand(name = "hpexpiretime", arity = -5, flags = "read-only fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hpexpiretime(RedisClient client, byte[][] argv) {
+        return httlGeneric(client, argv, true, true);
+    }
+
+    private byte[] httlGeneric(RedisClient client, byte[][] argv,
+                                boolean millis, boolean absolute) {
+        if (argv.length < 5 || !toStr(argv[2]).equalsIgnoreCase("FIELDS"))
+            throw RedisException.syntax();
+
+        int numFields;
+        try { numFields = Integer.parseInt(toStr(argv[3])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+
+        if (argv.length < 4 + numFields) throw RedisException.syntax();
+
+        RedisObject obj = db(client).lookupKeyOrReply(argv[1], RedisObjectConstants.OBJ_TYPE_HASH);
+        List<Object> result = new ArrayList<>();
+
+        if (obj == null) {
+            for (int i = 0; i < numFields; i++) result.add(HFE_NO_FIELD);
+            return RespEncoder.encodeArray(result);
+        }
+
+        Map<String, Long> expiries = getFieldExpiries(obj);
+        long now = System.currentTimeMillis();
+
+        for (int i = 0; i < numFields; i++) {
+            String field = toStr(argv[4 + i]);
+            if (hashGet(obj, toBytes(field)) == null) {
+                result.add(HFE_NO_FIELD);
+                continue;
+            }
+            Long expireAtMs = expiries.get(field);
+            if (expireAtMs == null) {
+                result.add(HFE_NO_TTL); // no TTL
+            } else if (absolute) {
+                result.add(millis ? expireAtMs : expireAtMs / 1000L);
+            } else {
+                long remaining = expireAtMs - now;
+                if (remaining <= 0) {
+                    result.add(HFE_NO_FIELD); // expired
+                } else {
+                    result.add(millis ? remaining : remaining / 1000L);
+                }
+            }
+        }
+
+        return RespEncoder.encodeArray(result);
+    }
+
+    /**
+     * HPERSIST key FIELDS numfields field [field ...]
+     *
+     * Remove the TTL from hash fields (make them persistent).
+     * Mirrors hpersistCommand() in t_hash.c.
+     *
+     * Returns per-field:
+     *   -2 = field does not exist
+     *   -1 = field has no TTL (already persistent)
+     *    1 = TTL removed
+     */
+    @RedisCommand(name = "hpersist", arity = -5, flags = "write fast", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] hpersist(RedisClient client, byte[][] argv) {
+        if (argv.length < 5 || !toStr(argv[2]).equalsIgnoreCase("FIELDS"))
+            throw RedisException.syntax();
+
+        int numFields;
+        try { numFields = Integer.parseInt(toStr(argv[3])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+
+        if (argv.length < 4 + numFields) throw RedisException.syntax();
+
+        RedisObject obj = db(client).lookupKeyOrReply(argv[1], RedisObjectConstants.OBJ_TYPE_HASH);
+        List<Object> result = new ArrayList<>();
+
+        if (obj == null) {
+            for (int i = 0; i < numFields; i++) result.add(HFE_NO_FIELD);
+            return RespEncoder.encodeArray(result);
+        }
+
+        Map<String, Long> expiries = getFieldExpiries(obj);
+
+        for (int i = 0; i < numFields; i++) {
+            String field = toStr(argv[4 + i]);
+            if (hashGet(obj, toBytes(field)) == null) {
+                result.add(HFE_NO_FIELD);
+            } else if (expiries.remove(field) != null) {
+                result.add(1L); // TTL removed
+            } else {
+                result.add(HFE_NO_TTL); // already persistent
+            }
+        }
+
         return RespEncoder.encodeArray(result);
     }
 }

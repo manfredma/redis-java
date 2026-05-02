@@ -84,7 +84,9 @@ public final class ReplicationCommands {
                 return null; // no reply for ACK
             }
             case "getack":
-                // Master asking replica for ack — we are the master, ignore
+                // REPLCONF GETACK received by master — not expected here since
+                // master sends GETACK *to* replicas, not the other way.
+                // But handle gracefully.
                 return RespEncoder.encodeSimpleString("OK");
             default:
                 return RespEncoder.encodeSimpleString("OK");

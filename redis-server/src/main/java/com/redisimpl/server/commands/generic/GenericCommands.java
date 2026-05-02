@@ -37,10 +37,21 @@ public final class GenericCommands {
         return RespEncoder.encodeInteger(deleted);
     }
 
+    /**
+     * UNLINK key [key ...] — mirrors unlinkCommand() in db.c + lazyfree.c.
+     *
+     * Immediately removes keys from the keyspace (like DEL) but defers freeing
+     * large collection values to the BIO lazy-free thread (mirrors dbAsyncDelete +
+     * freeObjAsync with LAZYFREE_THRESHOLD=64).
+     */
     @RedisCommand(name = "unlink", arity = -2, flags = "write fast", firstKey = 1, lastKey = -1, step = 1)
     public byte[] unlink(RedisClient client, byte[][] argv) {
-        // Async delete (same as DEL in this implementation)
-        return del(client, argv);
+        RedisDb db = db(client);
+        long deleted = 0;
+        for (int i = 1; i < argv.length; i++) {
+            if (db.asyncDelete(argv[i])) deleted++;
+        }
+        return RespEncoder.encodeInteger(deleted);
     }
 
     @RedisCommand(name = "exists", arity = -2, flags = "read-only fast", firstKey = 1, lastKey = -1, step = 1)
