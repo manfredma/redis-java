@@ -29,8 +29,9 @@ public final class ClusterNode {
     private final ClusterNodeInfo selfInfo;
     private final String nodeId;
     private final int port;
+    private GossipManager gossipManager;
 
-    /** Peer nodes added via meet() before start */
+    /** Peer nodes added via meet() before start (legacy in-process setup) */
     private final List<ClusterNodeInfo> peers = new ArrayList<>();
 
     public ClusterNode(int port) throws IOException {
@@ -44,11 +45,6 @@ public final class ClusterNode {
 
         // Register CLUSTER commands
         server.getCommandTable().register(new ClusterCommands(this));
-
-        // Intercept write commands to check slot ownership
-        // We do this via a ReplicationPropagator-style hook that runs before command dispatch
-        // Instead, we override via a wrapper — simpler: add a PreCommandHook
-        // For now, use the ClusterInterceptor approach below
     }
 
     public void addSlots(int from, int to) {
@@ -82,21 +78,38 @@ public final class ClusterNode {
     }
 
     public void start() throws IOException {
-        // Register all peer nodes into cluster state
+        // Register legacy in-process peers
         for (ClusterNodeInfo peer : peers) {
             clusterState.addNode(peer);
         }
         // Install cluster slot checker
         server.setClusterSlotChecker(argv -> {
             if (argv.length < 2) return null;
-            byte[] key = argv[1];
-            return checkSlot(key);
+            return checkSlot(argv[1]);
         });
+
+        // Start Gossip manager (cluster bus on port+10000)
+        gossipManager = new GossipManager(this);
+        try {
+            gossipManager.start();
+        } catch (IOException e) {
+            log.warn("Could not start cluster bus on port {}: {}",
+                    selfInfo.getPort() + 10000, e.getMessage());
+        }
+
         server.start();
     }
 
     public void stop() {
+        if (gossipManager != null) gossipManager.stop();
         server.stop();
+    }
+
+    /** Trigger CLUSTER MEET via Gossip protocol (real network). */
+    public void gossipMeet(String host, int peerPort) {
+        if (gossipManager != null) {
+            gossipManager.startMeet(host, peerPort);
+        }
     }
 
     public ClusterState getClusterState() { return clusterState; }
@@ -213,9 +226,15 @@ public final class ClusterNode {
                 }
                 case "MEET": {
                     if (argv.length < 4) return RespEncoder.encodeError("ERR syntax error");
-                    String host = new String(argv[2], StandardCharsets.UTF_8);
-                    int prt = Integer.parseInt(new String(argv[3], StandardCharsets.UTF_8));
-                    // Already known — just acknowledge
+                    String meetHost = new String(argv[2], StandardCharsets.UTF_8);
+                    int meetPort;
+                    try {
+                        meetPort = Integer.parseInt(new String(argv[3], StandardCharsets.UTF_8));
+                    } catch (NumberFormatException e) {
+                        return RespEncoder.encodeError("ERR Invalid port");
+                    }
+                    // Use GossipManager for real network MEET
+                    node.gossipMeet(meetHost, meetPort);
                     return RespEncoder.OK;
                 }
                 case "FORGET":
@@ -272,8 +291,10 @@ public final class ClusterNode {
             // Always include self first
             sb.append(selfInfo.toNodesLine()).append("\n");
             for (ClusterNodeInfo n : clusterState.allNodes()) {
-                if (n.isSelf()) continue; // already added above
-                // For temp nodes, still output them (peers are identified by port)
+                if (n.isSelf()) continue;
+                // Include all nodes including temp placeholders
+                // (temp nodes have nodeId starting with "temp-", but we still emit them
+                // so that CLUSTER NODES output contains port info for discovery)
                 sb.append(n.toNodesLine()).append("\n");
             }
             return RespEncoder.encodeBulkString(sb.toString().getBytes(StandardCharsets.UTF_8));

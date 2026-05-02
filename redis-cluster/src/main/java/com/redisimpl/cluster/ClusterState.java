@@ -20,6 +20,10 @@ public final class ClusterState {
         nodes.put(node.getNodeId(), node);
     }
 
+    public void removeNode(String nodeId) {
+        nodes.remove(nodeId);
+    }
+
     public ClusterNodeInfo getNode(String nodeId) {
         return nodes.get(nodeId);
     }
