@@ -36,4 +36,9 @@ public final class ReplicationInfo {
     public void setMasterLastIo(long t)       { this.masterLastIo = t; }
     public long getReplicaOffset()            { return replicaOffset; }
     public void setReplicaOffset(long off)    { this.replicaOffset = off; }
+
+    /** slave0:ip=...,port=...,state=online,offset=...,lag=0 lines */
+    private volatile String slaveLines = "";
+    public String getSlaveLines()             { return slaveLines; }
+    public void setSlaveLines(String s)       { this.slaveLines = s; }
 }

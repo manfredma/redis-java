@@ -61,6 +61,11 @@ public final class ReplicationManager
         info.setReplId(replId);
         info.setMasterOffset(0);
         info.setConnectedSlaves(0);
+        // Refresh slave info every second via a time event
+        server.getEventLoop().aeCreateTimeEvent(1000, (id, data) -> {
+            refreshReplicationInfo();
+            return 1000;
+        });
         log.info("ReplicationManager attached to server on port {}", server.getPort());
     }
 
@@ -99,11 +104,39 @@ public final class ReplicationManager
         }
     }
 
+    /** Refresh the ReplicationInfo slave lines from current replica state. */
+    public void refreshReplicationInfo() {
+        com.redisimpl.server.replication.ReplicationInfo info = server.getReplicationInfo();
+        int count = 0;
+        StringBuilder sb = new StringBuilder();
+        for (ReplicaInfo replica : replicas.values()) {
+            if (replica.getState() == ReplicaInfo.State.ONLINE) {
+                try {
+                    java.net.InetSocketAddress addr =
+                            (java.net.InetSocketAddress) replica.getChannel().getRemoteAddress();
+                    String host = addr != null ? addr.getAddress().getHostAddress() : "127.0.0.1";
+                    int port = replica.getListeningPort() > 0 ? replica.getListeningPort()
+                            : (addr != null ? addr.getPort() : 0);
+                    sb.append("slave").append(count).append(":ip=").append(host)
+                      .append(",port=").append(port)
+                      .append(",state=online,offset=").append(replica.getReplicaOffset())
+                      .append(",lag=0\r\n");
+                    count++;
+                } catch (Exception ignored) {}
+            }
+        }
+        info.setSlaveLines(sb.toString());
+        info.setConnectedSlaves(count);
+        info.setReplId(replId);
+        info.setMasterOffset(masterOffset.get());
+    }
+
     /**
      * Propagate a write command to all online replicas.
      * Called after every write command executes on master.
      */
     public void propagate(byte[][] argv) {
+        refreshReplicationInfo();
         if (replicas.isEmpty()) return;
 
         byte[] encoded = encodeCommand(argv);

@@ -128,6 +128,11 @@ public final class ServerCommands {
             } else {
                 sb.append("role:master\r\n");
                 sb.append("connected_slaves:").append(ri.getConnectedSlaves()).append("\r\n");
+                String slaveLines = ri.getSlaveLines();
+                if (slaveLines != null && !slaveLines.isEmpty()) {
+                    sb.append(slaveLines);
+                    if (!slaveLines.endsWith("\r\n")) sb.append("\r\n");
+                }
                 sb.append("master_replid:").append(ri.getReplId()).append("\r\n");
                 sb.append("master_repl_offset:").append(ri.getMasterOffset()).append("\r\n");
                 sb.append("repl_backlog_active:0\r\n");
