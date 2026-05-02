@@ -49,14 +49,59 @@ public final class QuickList {
     @Deprecated
     public static final int QUICKLIST_NODE_MAX_VALUE   = 64;
 
-    /** Doubly-linked node */
+    // ---- Compression constants (mirrors quicklist.c) ----
+    private static final int MIN_COMPRESS_BYTES   = 48;
+    private static final int MIN_COMPRESS_IMPROVE = 8;
+
+    /** Doubly-linked node — mirrors quicklistNode in quicklist.h */
     static final class Node {
-        ListPack pack;
+        ListPack pack;          // uncompressed data (null when compressed)
+        byte[] compressed;      // LZF-compressed bytes (null when raw)
+        int uncompressedSize;   // original byte size (for decompression)
+        boolean isCompressed;   // QUICKLIST_NODE_ENCODING_LZF
         Node prev;
         Node next;
 
         Node(ListPack pack) {
             this.pack = pack;
+            this.isCompressed = false;
+        }
+
+        /**
+         * Compress this node using LZF — mirrors __quicklistCompressNode().
+         * Only compresses if uncompressedSize >= MIN_COMPRESS_BYTES and
+         * compression saves >= MIN_COMPRESS_IMPROVE bytes.
+         */
+        void compress() {
+            if (isCompressed || pack == null) return;
+            byte[] raw = pack.getBytes();
+            if (raw.length < MIN_COMPRESS_BYTES) return;
+            try {
+                byte[] lzf = com.ning.compress.lzf.LZFEncoder.encode(raw);
+                if (raw.length - lzf.length >= MIN_COMPRESS_IMPROVE) {
+                    compressed = lzf;
+                    uncompressedSize = raw.length;
+                    pack = null;
+                    isCompressed = true;
+                }
+            } catch (Exception ignored) {
+                // LZF failed (data not compressible) — keep as RAW
+            }
+        }
+
+        /**
+         * Decompress this node — mirrors __quicklistDecompressNode().
+         */
+        void decompress() {
+            if (!isCompressed || compressed == null) return;
+            try {
+                byte[] raw = com.ning.compress.lzf.LZFDecoder.decode(compressed);
+                pack = ListPack.fromBytes(raw);
+                compressed = null;
+                isCompressed = false;
+            } catch (Exception e) {
+                throw new RuntimeException("QuickList LZF decompression failed", e);
+            }
         }
     }
 
@@ -131,13 +176,13 @@ public final class QuickList {
     public QuickList rpush(byte[] value) {
         Mut m = new Mut(this);
         m.rpush(value, fill);
-        return m.build();
+        return m.build().applyCompression();
     }
 
     public QuickList lpush(byte[] value) {
         Mut m = new Mut(this);
         m.lpush(value, fill);
-        return m.build();
+        return m.build().applyCompression();
     }
 
     // ---- Pop ----
@@ -185,6 +230,7 @@ public final class QuickList {
         long pos = 0;
         Node n = head;
         while (n != null) {
+            Mut.ensureDecompressed(n);
             int nodeSize = n.pack.size();
             if (pos + nodeSize > actual) {
                 return n.pack.get((int) (actual - pos));
@@ -207,6 +253,7 @@ public final class QuickList {
         long pos = 0;
         Node n = head;
         while (n != null && pos <= stop) {
+            Mut.ensureDecompressed(n);
             int nodeSize = n.pack.size();
             for (int i = 0; i < nodeSize; i++) {
                 long globalIdx = pos + i;
@@ -315,19 +362,26 @@ public final class QuickList {
             this.tail = prevNew;
         }
 
+        /** Ensure node is decompressed before accessing its pack. */
+        static void ensureDecompressed(Node n) {
+            if (n != null && n.isCompressed) n.decompress();
+        }
+
         void rpush(byte[] value, int fill) {
             if (tail == null) {
                 Node newNode = new Node(ListPack.create().append(value));
                 head = tail = newNode;
                 size++;
-            } else if (nodeExceedsLimit(fill, tail.pack.totalBytes(), tail.pack.size(), value.length)) {
-                Node newNode = new Node(ListPack.create().append(value));
-                newNode.prev = tail;
-                tail.next = newNode;
-                tail = newNode;
-                size++;
             } else {
-                tail.pack = tail.pack.append(value);
+                ensureDecompressed(tail);
+                if (nodeExceedsLimit(fill, tail.pack.totalBytes(), tail.pack.size(), value.length)) {
+                    Node newNode = new Node(ListPack.create().append(value));
+                    newNode.prev = tail;
+                    tail.next = newNode;
+                    tail = newNode;
+                } else {
+                    tail.pack = tail.pack.append(value);
+                }
                 size++;
             }
         }
@@ -340,14 +394,16 @@ public final class QuickList {
                 Node newNode = new Node(ListPack.create().append(value));
                 head = tail = newNode;
                 size++;
-            } else if (nodeExceedsLimit(fill, head.pack.totalBytes(), head.pack.size(), value.length)) {
-                Node newNode = new Node(ListPack.create().append(value));
-                newNode.next = head;
-                head.prev = newNode;
-                head = newNode;
-                size++;
             } else {
-                head.pack = head.pack.prepend(value);
+                ensureDecompressed(head);
+                if (nodeExceedsLimit(fill, head.pack.totalBytes(), head.pack.size(), value.length)) {
+                    Node newNode = new Node(ListPack.create().append(value));
+                    newNode.next = head;
+                    head.prev = newNode;
+                    head = newNode;
+                } else {
+                    head.pack = head.pack.prepend(value);
+                }
                 size++;
             }
         }
@@ -356,30 +412,29 @@ public final class QuickList {
 
         byte[] lpop() {
             if (head == null) return null;
+            ensureDecompressed(head);
             byte[] val = head.pack.get(0);
             head.pack = head.pack.delete(0);
             size--;
-            if (head.pack.size() == 0) {
-                unlinkNode(head);
-            }
+            if (head.pack.size() == 0) unlinkNode(head);
             return val;
         }
 
         byte[] rpop() {
             if (tail == null) return null;
+            ensureDecompressed(tail);
             int lastIdx = tail.pack.size() - 1;
             byte[] val = tail.pack.get(lastIdx);
             tail.pack = tail.pack.delete(lastIdx);
             size--;
-            if (tail.pack.size() == 0) {
-                unlinkNode(tail);
-            }
+            if (tail.pack.size() == 0) unlinkNode(tail);
             return val;
         }
 
         boolean linsert(byte[] pivot, boolean before, byte[] value) {
             Node n = head;
             while (n != null) {
+                ensureDecompressed(n);
                 int nodeSize = n.pack.size();
                 for (int i = 0; i < nodeSize; i++) {
                     if (Arrays.equals(n.pack.get(i), pivot)) {
@@ -402,6 +457,7 @@ public final class QuickList {
             long pos = 0;
             Node n = head;
             while (n != null) {
+                ensureDecompressed(n);
                 int nodeSize = n.pack.size();
                 if (pos + nodeSize > idx) {
                     n.pack = n.pack.set((int) (idx - pos), value);
@@ -417,6 +473,7 @@ public final class QuickList {
             if (count >= 0) {
                 Node n = head;
                 while (n != null && (count == 0 || removed < count)) {
+                    ensureDecompressed(n);
                     Node next = n.next;
                     int i = 0;
                     while (i < n.pack.size() && (count == 0 || removed < count)) {
@@ -435,6 +492,7 @@ public final class QuickList {
                 long absCount = -count;
                 Node n = tail;
                 while (n != null && removed < absCount) {
+                    ensureDecompressed(n);
                     Node prev = n.prev;
                     int i = n.pack.size() - 1;
                     while (i >= 0 && removed < absCount) {
@@ -460,6 +518,7 @@ public final class QuickList {
         }
 
         private void splitNode(Node node) {
+            ensureDecompressed(node);
             int half = node.pack.size() / 2;
             List<byte[]> all = node.pack.toList();
             ListPack left = ListPack.create();
@@ -482,8 +541,51 @@ public final class QuickList {
         }
     }
 
+    /**
+     * Apply LZF compression to middle nodes, keeping {@code compress} nodes
+     * from each end uncompressed — mirrors __quicklistCompress() in quicklist.c.
+     *
+     * Called after mutations when compress > 0.
+     */
+    public QuickList applyCompression() {
+        if (compress <= 0 || head == null) return this;
+        // Count total nodes
+        int nodeCount = 0;
+        Node n = head;
+        while (n != null) { nodeCount++; n = n.next; }
+        if (nodeCount <= compress * 2) {
+            // Not enough nodes — decompress everything
+            n = head;
+            while (n != null) { n.decompress(); n = n.next; }
+            return this;
+        }
+
+        // Walk from head: decompress first `compress` nodes
+        n = head;
+        for (int i = 0; i < compress && n != null; i++) {
+            n.decompress();
+            n = n.next;
+        }
+        // Compress middle nodes
+        Node endOfHead = n;
+        Node startOfTail = tail;
+        Node r = tail;
+        for (int i = 0; i < compress && r != null; i++) {
+            r.decompress();
+            startOfTail = r;
+            r = r.prev;
+        }
+        // Compress everything between endOfHead and startOfTail
+        n = endOfHead;
+        while (n != null && n != startOfTail) {
+            n.compress();
+            n = n.next;
+        }
+        return this;
+    }
+
     @Override
     public String toString() {
-        return "QuickList{size=" + size + "}";
+        return "QuickList{size=" + size + ", fill=" + fill + ", compress=" + compress + "}";
     }
 }

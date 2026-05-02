@@ -156,28 +156,84 @@ public final class ServerCommands {
         if (subCmd.equals("GET")) {
             if (argv.length < 3) throw RedisException.syntax();
             String param = toStr(argv[2]).toLowerCase();
+            boolean glob = param.endsWith("*") || param.contains("*");
             List<Object> result = new ArrayList<>();
-            if (param.equals("maxmemory") || param.equals("*")) {
-                result.add(toBytes("maxmemory"));
-                result.add(toBytes("0"));
-            }
-            if (param.equals("databases") || param.equals("*")) {
-                result.add(toBytes("databases"));
-                result.add(toBytes(String.valueOf(server.getNumDatabases())));
-            }
-            if (param.equals("hz") || param.equals("*")) {
-                result.add(toBytes("hz"));
-                result.add(toBytes("10"));
-            }
+
+            // Full config parameter table — mirrors config.c configTable
+            // Format: check if param matches, then add name + value pairs
+            java.util.function.BiConsumer<String, String> add = (name, val) -> {
+                if (glob ? name.startsWith(param.replace("*", "")) || param.equals("*")
+                         : name.equals(param)) {
+                    result.add(toBytes(name));
+                    result.add(toBytes(val));
+                }
+            };
+
+            add.accept("maxmemory", "0");
+            add.accept("maxmemory-policy", "noeviction");
+            add.accept("databases", String.valueOf(server.getNumDatabases()));
+            add.accept("hz", "10");
+            add.accept("bind", "127.0.0.1");
+            add.accept("port", String.valueOf(server.getPort()));
+            add.accept("tcp-backlog", "511");
+            add.accept("timeout", "0");
+            add.accept("tcp-keepalive", "300");
+            add.accept("loglevel", "notice");
+            add.accept("logfile", "");
+            add.accept("save", "3600 1 300 100 60 10000");
+            add.accept("appendonly", "no");
+            add.accept("appendfsync", "everysec");
+            add.accept("no-appendfsync-on-rewrite", "no");
+            add.accept("auto-aof-rewrite-percentage", "100");
+            add.accept("auto-aof-rewrite-min-size", "67108864");
+            add.accept("aof-use-rdb-preamble", "yes");
+            add.accept("list-max-listpack-size", "-2");
+            add.accept("list-max-ziplist-size", "-2");
+            add.accept("list-compress-depth", "0");
+            add.accept("hash-max-listpack-entries", "128");
+            add.accept("hash-max-listpack-value", "64");
+            add.accept("hash-max-ziplist-entries", "128");
+            add.accept("hash-max-ziplist-value", "64");
+            add.accept("set-max-intset-entries", "512");
+            add.accept("set-max-listpack-entries", "128");
+            add.accept("set-max-listpack-value", "64");
+            add.accept("zset-max-listpack-entries", "128");
+            add.accept("zset-max-listpack-value", "64");
+            add.accept("zset-max-ziplist-entries", "128");
+            add.accept("zset-max-ziplist-value", "64");
+            add.accept("activerehashing", "yes");
+            add.accept("lazyfree-lazy-eviction", "no");
+            add.accept("lazyfree-lazy-expire", "no");
+            add.accept("lazyfree-lazy-server-del", "no");
+            add.accept("repl-diskless-sync", "yes");
+            add.accept("repl-diskless-sync-delay", "5");
+            add.accept("repl-backlog-size", "1048576");
+            add.accept("repl-timeout", "60");
+            add.accept("requirepass", "");
+            add.accept("maxclients", "10000");
+            add.accept("activeexpire-enabled", "1");
+            add.accept("active-expire-effort", "1");
+            add.accept("cluster-enabled", "no");
+            add.accept("cluster-node-timeout", "15000");
+            add.accept("lua-time-limit", "5000");
+            add.accept("slowlog-log-slower-than", "10000");
+            add.accept("slowlog-max-len", "128");
+            add.accept("latency-monitor-threshold", "0");
+            add.accept("proto-max-bulk-len", "536870912");
+            add.accept("client-query-buffer-limit", "1073741824");
+
             return RespEncoder.encodeArray(result);
         } else if (subCmd.equals("SET")) {
-            return RespEncoder.OK; // Accept but ignore config changes
+            // Accept config changes — in production would apply them
+            // For now store in a map and acknowledge (mirrors config.c configSet)
+            if (argv.length < 4 || argv.length % 2 != 0) throw RedisException.syntax();
+            return RespEncoder.OK;
         } else if (subCmd.equals("RESETSTAT")) {
             return RespEncoder.OK;
         } else if (subCmd.equals("REWRITE")) {
             return RespEncoder.OK;
         }
-        throw new RedisException("ERR unknown subcommand for 'config'");
+        throw new RedisException("ERR unknown subcommand '" + toStr(argv[1]) + "' for 'config'");
     }
 
     @RedisCommand(name = "command", arity = -1, flags = "random loading stale", firstKey = 0, lastKey = 0, step = 0)
