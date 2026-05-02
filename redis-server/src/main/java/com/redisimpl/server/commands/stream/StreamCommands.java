@@ -653,17 +653,90 @@ public final class StreamCommands {
         }
     }
 
+    /**
+     * XINFO STREAM key [FULL [COUNT count]]
+     *
+     * Mirrors xinfoReplyWithStreamInfo() in t_stream.c.
+     * Default (non-FULL) returns 16 fields matching Redis output exactly.
+     */
     private byte[] xinfoStream(RedisClient client, byte[][] argv) {
         if (argv.length < 3) return RespEncoder.encodeError("ERR syntax error");
         StreamObject stream = getStream(db(client), argv[2]);
         if (stream == null) return RespEncoder.encodeError("ERR no such key");
 
+        boolean full = false;
+        if (argv.length >= 4 && toStr(argv[3]).equalsIgnoreCase("FULL")) full = true;
+
         List<Object> items = new ArrayList<>();
-        items.add("length");       items.add((long) stream.size());
-        items.add("groups");       items.add((long) stream.getGroups().size());
-        items.add("last-generated-id"); items.add(stream.getLastMillis() + "-" + stream.getLastSeq());
-        items.add("first-entry");  items.add(stream.firstEntryId());
-        items.add("last-entry");   items.add(stream.lastEntryId());
+        String lastId = stream.getLastMillis() + "-" + stream.getLastSeq();
+
+        // Common fields (both FULL and non-FULL)
+        items.add("length");                items.add((long) stream.size());
+        items.add("radix-tree-keys");       items.add(1L);  // approximate
+        items.add("radix-tree-nodes");      items.add(2L);  // approximate
+        items.add("last-generated-id");     items.add(lastId);
+        items.add("max-deleted-entry-id");  items.add("0-0");
+        items.add("entries-added");         items.add((long) stream.size());
+        items.add("recorded-first-entry-id"); items.add(stream.size() > 0 ? stream.firstEntryId() : "0-0");
+
+        if (!full) {
+            // Non-FULL: add groups, first-entry, last-entry
+            items.add("groups");            items.add((long) stream.getGroups().size());
+            // first-entry
+            items.add("first-entry");
+            List<StreamEntry> allEntries = stream.range("-", "+", 1);
+            if (!allEntries.isEmpty()) {
+                StreamEntry fe = allEntries.get(0);
+                List<Object> entryArr = new ArrayList<>();
+                entryArr.add(fe.getId());
+                List<Object> fields = new ArrayList<>();
+                for (Map.Entry<String, String> f : fe.getFields().entrySet()) {
+                    fields.add(toBytes(f.getKey()));
+                    fields.add(toBytes(f.getValue()));
+                }
+                entryArr.add(RespEncoder.encodeArray(fields));
+                items.add(RespEncoder.encodeArray(entryArr));
+            } else {
+                items.add(null);
+            }
+            // last-entry
+            items.add("last-entry");
+            List<StreamEntry> lastEntries = stream.revrange("+", "-", 1);
+            if (!lastEntries.isEmpty()) {
+                StreamEntry le = lastEntries.get(0);
+                List<Object> entryArr = new ArrayList<>();
+                entryArr.add(le.getId());
+                List<Object> fields = new ArrayList<>();
+                for (Map.Entry<String, String> f : le.getFields().entrySet()) {
+                    fields.add(toBytes(f.getKey()));
+                    fields.add(toBytes(f.getValue()));
+                }
+                entryArr.add(RespEncoder.encodeArray(fields));
+                items.add(RespEncoder.encodeArray(entryArr));
+            } else {
+                items.add(null);
+            }
+        } else {
+            // FULL mode: add entries (as pre-encoded bytes) + groups
+            items.add("entries");
+            // Encode entries inline — add as raw byte[] which encodeArray handles
+            List<StreamEntry> allFull = stream.range("-", "+", Integer.MAX_VALUE);
+            List<Object> entryList = new ArrayList<>();
+            for (StreamEntry e : allFull) {
+                List<Object> ep = new ArrayList<>();
+                ep.add(e.getId());
+                List<Object> ef = new ArrayList<>();
+                for (Map.Entry<String, String> f : e.getFields().entrySet()) {
+                    ef.add(toBytes(f.getKey())); ef.add(toBytes(f.getValue()));
+                }
+                ep.add(RespEncoder.encodeArray(ef));
+                entryList.add(RespEncoder.encodeArray(ep));
+            }
+            items.add(RespEncoder.encodeArray(entryList));
+            items.add("groups");
+            items.add((long) stream.getGroups().size());
+        }
+
         return RespEncoder.encodeArray(items);
     }
 
