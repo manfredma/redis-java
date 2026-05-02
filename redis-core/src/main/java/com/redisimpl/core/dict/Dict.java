@@ -358,6 +358,97 @@ public final class Dict implements Iterable<Dict.Entry> {
         }
     }
 
+    // ---- dictScan — safe cursor-based iteration (mirrors dictScan() in dict.c) ----
+
+    /**
+     * Callback for dictScan.
+     */
+    @FunctionalInterface
+    public interface ScanCallback {
+        void accept(byte[] key, Object value);
+    }
+
+    /**
+     * Cursor-based scan, safe across rehashing.
+     *
+     * Mirrors dictScan() / dictScanDefrag() from dict.c using the
+     * reverse-binary-counter algorithm designed by Pieter Noordhuis.
+     *
+     * Algorithm overview:
+     *   - Reverse the cursor bits, increment, reverse back → advances in
+     *     a way that guarantees all buckets are visited exactly once when
+     *     the table size is stable, and no bucket is missed even if the
+     *     table resizes between calls.
+     *   - When rehashing (two tables), scan the smaller table and all
+     *     expansions of the current bucket in the larger table.
+     *
+     * @param cursor  0 to start; returned value from previous call to continue.
+     * @param fn      called for every entry in the scanned bucket(s).
+     * @return next cursor (0 means iteration complete).
+     */
+    public long scan(long cursor, ScanCallback fn) {
+        if (size() == 0) return 0;
+
+        if (!isRehashing()) {
+            // ---- Single table ----
+            int m0 = ht0.sizeMask;
+            // Scan the bucket at cursor & m0
+            Entry e = ht0.table[(int)(cursor & m0)];
+            while (e != null) {
+                fn.accept(e.key, e.value);
+                e = e.next;
+            }
+            // Advance cursor with reverse-binary-counter
+            cursor |= ~(long) m0;         // set unmasked bits
+            cursor = reverseBits(cursor);
+            cursor++;
+            cursor = reverseBits(cursor);
+        } else {
+            // ---- Two tables during rehash ----
+            HashTable t0 = ht0, t1 = ht1;
+            // Ensure t0 is smaller
+            if (t0.size > t1.size) { HashTable tmp = t0; t0 = t1; t1 = tmp; }
+
+            int m0 = t0.sizeMask;
+            int m1 = t1.sizeMask;
+
+            // Scan bucket in smaller table
+            Entry e = t0.table[(int)(cursor & m0)];
+            while (e != null) { fn.accept(e.key, e.value); e = e.next; }
+
+            // Scan all expansions of this bucket in the larger table
+            long v = cursor;
+            do {
+                Entry e1 = t1.table[(int)(v & m1)];
+                while (e1 != null) { fn.accept(e1.key, e1.value); e1 = e1.next; }
+
+                // Increment the reverse cursor over bits NOT covered by m0
+                v |= ~(long) m1;
+                v = reverseBits(v);
+                v++;
+                v = reverseBits(v);
+            } while ((v & (long)(m0 ^ m1)) != 0);
+
+            cursor = v;
+        }
+
+        return cursor;
+    }
+
+    /**
+     * Reverse all 64 bits of v — used by the dictScan cursor algorithm.
+     * Mirrors the rev() helper in dict.c.
+     */
+    static long reverseBits(long v) {
+        long s = 64;
+        long mask = ~0L;
+        while ((s >>= 1) > 0) {
+            mask ^= (mask << s);
+            v = ((v >> s) & mask) | ((v << s) & ~mask);
+        }
+        return v;
+    }
+
     @Override
     public String toString() {
         return "Dict{size=" + size() + ", rehashing=" + isRehashing() + "}";

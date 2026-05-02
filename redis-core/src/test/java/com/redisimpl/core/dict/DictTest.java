@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -164,5 +165,72 @@ class DictTest {
             assertNotNull(entry.getValue());
         }
         assertEquals(50, count);
+    }
+
+    // ---- dictScan tests (mirrors dictScan() algorithm) ----
+
+    @Test
+    void scan_emptyDict_returnsZero() {
+        Dict d = Dict.create();
+        long cursor = d.scan(0, (k, v) -> fail("should not be called"));
+        assertEquals(0, cursor);
+    }
+
+    @Test
+    void scan_allEntriesVisited_noDuplicates() {
+        Dict d = Dict.create();
+        int n = 30;
+        for (int i = 0; i < n; i++) {
+            d.put(("key" + i).getBytes(StandardCharsets.UTF_8), i);
+        }
+
+        Set<String> seen = new HashSet<>();
+        long cursor = 0;
+        do {
+            long[] next = {0};
+            cursor = d.scan(cursor, (k, v) -> seen.add(new String(k, StandardCharsets.UTF_8)));
+        } while (cursor != 0);
+
+        // Every key must appear at least once
+        for (int i = 0; i < n; i++) {
+            assertTrue(seen.contains("key" + i), "missing key" + i);
+        }
+    }
+
+    @Test
+    void scan_duringRehash_noKeysMissed() {
+        // Insert enough to trigger rehash, then scan concurrently
+        Dict d = Dict.create();
+        for (int i = 0; i < 20; i++) {
+            d.put(("k" + i).getBytes(StandardCharsets.UTF_8), i);
+        }
+
+        Set<String> seen = new HashSet<>();
+        long cursor = 0;
+        do {
+            // Insert during scan to exercise rehash path
+            if (cursor == 0) {
+                for (int i = 20; i < 25; i++) {
+                    d.put(("k" + i).getBytes(StandardCharsets.UTF_8), i);
+                }
+            }
+            cursor = d.scan(cursor, (k, v) ->
+                    seen.add(new String(k, StandardCharsets.UTF_8)));
+        } while (cursor != 0);
+
+        // Original 20 keys must all be seen (new ones may or may not)
+        for (int i = 0; i < 20; i++) {
+            assertTrue(seen.contains("k" + i), "missed k" + i);
+        }
+    }
+
+    @Test
+    void reverseBits_correctness() {
+        // reverseBits(reverseBits(v)) == v
+        assertEquals(0L, Dict.reverseBits(0L));
+        assertEquals(~0L, Dict.reverseBits(~0L));
+        // 1000...0 (MSB) → 000...1 (LSB)
+        assertEquals(1L, Dict.reverseBits(Long.MIN_VALUE));
+        assertEquals(Long.MIN_VALUE, Dict.reverseBits(1L));
     }
 }

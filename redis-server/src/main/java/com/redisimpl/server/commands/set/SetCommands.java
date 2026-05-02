@@ -224,6 +224,44 @@ public final class SetCommands {
         return encodeSet(diff(client, argv, 1));
     }
 
+    /**
+     * SINTERCARD numkeys key [key ...] [LIMIT limit]
+     *
+     * Returns cardinality of intersection, bounded by optional LIMIT.
+     * Mirrors sinterCardCommand() in t_set.c.
+     */
+    @RedisCommand(name = "sintercard", arity = -3, flags = "read-only", firstKey = 2, lastKey = 2, step = 1)
+    public byte[] sintercard(RedisClient client, byte[][] argv) {
+        int numKeys;
+        try { numKeys = (int) Long.parseLong(toStr(argv[1])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+        if (numKeys <= 0) throw new RedisException("ERR numkeys should be greater than 0");
+        if (numKeys > argv.length - 2) throw new RedisException("ERR Number of keys can't be greater than number of args");
+
+        long limit = 0;
+        for (int j = 2 + numKeys; j < argv.length; j++) {
+            String opt = toStr(argv[j]).toUpperCase();
+            if (opt.equals("LIMIT") && j + 1 < argv.length) {
+                try { limit = Long.parseLong(toStr(argv[++j])); }
+                catch (NumberFormatException e) { throw RedisException.notInteger(); }
+                if (limit < 0) throw new RedisException("ERR LIMIT can't be negative");
+            } else {
+                throw RedisException.syntax();
+            }
+        }
+
+        // Build synthetic argv for intersection: keys start at index 2
+        byte[][] interArgv = new byte[2 + numKeys][];
+        interArgv[0] = argv[0];
+        interArgv[1] = argv[1];
+        for (int i = 0; i < numKeys; i++) interArgv[2 + i] = argv[2 + i];
+
+        Set<String> inter = intersection(client, interArgv, 2);
+        long card = inter.size();
+        if (limit > 0 && card > limit) card = limit;
+        return RespEncoder.encodeInteger(card);
+    }
+
     @RedisCommand(name = "sinterstore", arity = -3, flags = "write denyoom", firstKey = 1, lastKey = -1, step = 1)
     public byte[] sinterstore(RedisClient client, byte[][] argv) {
         Set<String> result = intersection(client, argv, 2);

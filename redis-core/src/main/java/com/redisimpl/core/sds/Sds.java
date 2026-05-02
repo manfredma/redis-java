@@ -1,38 +1,56 @@
 package com.redisimpl.core.sds;
 
-import lombok.Getter;
-
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /**
- * Simple Dynamic String — Java port of Redis's sds.
+ * Simple Dynamic String — Java port of Redis sds.c.
  *
- * <p>Mirrors the semantics of Redis's sds.c:
- * <ul>
- *   <li>Tracks {@code len} (used bytes) and {@code alloc} (allocated capacity).</li>
- *   <li>Append doubles capacity when {@code len < 1 MB}; adds 1 MB otherwise.</li>
- *   <li>Immutable semantics: mutating operations return a new {@code Sds}.</li>
- * </ul>
+ * Encoding type selection mirrors sdsReqType():
+ *   TYPE_5:  len <  32   (no alloc field; len stored in 5 high bits of flags)
+ *   TYPE_8:  len <= 255  (uint8 len/alloc)
+ *   TYPE_16: len <= 65535
+ *   TYPE_32: len <= 4GB-1
+ *   TYPE_64: larger
+ *
+ * Memory growth strategy mirrors sdsMakeRoomFor() with greedy=1:
+ *   newLen < SDS_MAX_PREALLOC (1MB) → alloc = newLen * 2
+ *   newLen >= SDS_MAX_PREALLOC      → alloc = newLen + SDS_MAX_PREALLOC
+ *   If appending, use TYPE_8 minimum (not TYPE_5) to preserve alloc field.
+ *
+ * Java implementation is immutable (each mutation returns a new Sds).
  */
-@Getter
 public final class Sds {
 
-    private static final int SDS_MAX_PREALLOC = 1024 * 1024; // 1 MB
+    // ---- Encoding types (mirrors SDS_TYPE_* in sds.h) ----
+    public static final int SDS_TYPE_5  = 0; // len < 32
+    public static final int SDS_TYPE_8  = 1; // len <= 0xFF
+    public static final int SDS_TYPE_16 = 2; // len <= 0xFFFF
+    public static final int SDS_TYPE_32 = 3; // len <= 0xFFFFFFFFL
+    public static final int SDS_TYPE_64 = 4; // larger
 
-    /** Actual content bytes. Length is {@code len}, not {@code buf.length}. */
+    private static final long SDS_MAX_PREALLOC = 1024 * 1024L; // 1 MB
+
+    // Maximum len for each type (mirrors sdsTypeMaxSize())
+    private static final long TYPE5_MAX  = (1L << 5) - 1;   // 31
+    private static final long TYPE8_MAX  = (1L << 8) - 1;   // 255
+    private static final long TYPE16_MAX = (1L << 16) - 1;  // 65535
+    private static final long TYPE32_MAX = (1L << 32) - 1;  // 4294967295
+
+    /** Content bytes. Only [0, len) are valid. */
     private final byte[] buf;
-
     /** Number of used bytes. */
     private final int len;
-
     /** Allocated capacity (== buf.length). */
     private final int alloc;
+    /** Encoding type (SDS_TYPE_*). */
+    private final int type;
 
     private Sds(byte[] buf, int len) {
-        this.buf = buf;
-        this.len = len;
+        this.buf   = buf;
+        this.len   = len;
         this.alloc = buf.length;
+        this.type  = sdsReqType(len);
     }
 
     // ---- Factory methods ----
@@ -52,57 +70,61 @@ public final class Sds {
         return new Sds(bytes.clone(), bytes.length);
     }
 
+    // ---- Encoding type selection (mirrors sdsReqType()) ----
+
+    /**
+     * Returns the SDS encoding type for a string of the given length.
+     * Mirrors sdsReqType() in sds.c exactly.
+     */
+    public static int sdsReqType(long len) {
+        if (len < (1L << 5))  return SDS_TYPE_5;
+        if (len <= TYPE8_MAX) return SDS_TYPE_8;
+        if (len <= TYPE16_MAX) return SDS_TYPE_16;
+        if (len <= TYPE32_MAX) return SDS_TYPE_32;
+        return SDS_TYPE_64;
+    }
+
     // ---- Core operations ----
 
     /**
-     * Append bytes to this Sds, returning a new Sds.
-     * Growth strategy: if current len < 1MB, new alloc = (len+addLen)*2;
-     * otherwise new alloc = len + addLen + 1MB.
+     * Append bytes, returning a new Sds.
+     * Mirrors sdsMakeRoomFor(greedy=1) + sdscatlen().
+     * When appending, TYPE_5 is never used (no alloc field) → minimum TYPE_8.
      */
     public Sds append(byte[] addition) {
         if (addition == null || addition.length == 0) return this;
-        int newLen = this.len + addition.length;
-        int newAlloc;
-        if (newLen < SDS_MAX_PREALLOC) {
-            newAlloc = newLen * 2;
-        } else {
-            newAlloc = newLen + SDS_MAX_PREALLOC;
-        }
-        byte[] newBuf = new byte[newAlloc];
+        long newLen = (long) this.len + addition.length;
+        long newAlloc = greedyAlloc(newLen);
+        byte[] newBuf = new byte[(int) newAlloc];
         System.arraycopy(this.buf, 0, newBuf, 0, this.len);
         System.arraycopy(addition, 0, newBuf, this.len, addition.length);
-        return new Sds(newBuf, newLen);
+        return new Sds(newBuf, (int) newLen);
     }
 
-    /**
-     * Append a String to this Sds, returning a new Sds.
-     */
     public Sds appendStr(String s) {
         if (s == null || s.isEmpty()) return this;
         return append(s.getBytes(StandardCharsets.UTF_8));
     }
 
     /**
-     * Extend this Sds to {@code newLen} bytes, filling extra bytes with zero.
-     * If {@code newLen <= len}, returns this unchanged.
+     * Grow to newLen bytes, zero-filling the added region.
+     * Mirrors sdsgrowzero().
      */
     public Sds sdsgrowzero(int newLen) {
         if (newLen <= this.len) return this;
         byte[] newBuf = Arrays.copyOf(this.buf, newLen);
-        // Arrays.copyOf already zero-fills the new portion
+        // Arrays.copyOf zero-fills the new portion
         return new Sds(newBuf, newLen);
     }
 
     /**
-     * Return a sub-range [start, end] (inclusive, supports negative indices).
-     * Follows Redis sdsrange semantics.
+     * Return sub-range [start, end] (inclusive, supports negative indices).
+     * Mirrors sdsrange().
      */
     public Sds sdsrange(int start, int end) {
         if (len == 0) return empty();
-        // Normalize negative indices
         if (start < 0) start = Math.max(len + start, 0);
         if (end < 0)   end   = len + end;
-        // Clamp
         if (start > end || start >= len) return empty();
         end = Math.min(end, len - 1);
         int rangeLen = end - start + 1;
@@ -111,7 +133,36 @@ public final class Sds {
         return new Sds(newBuf, rangeLen);
     }
 
+    /**
+     * Grow allocation to hold addlen extra bytes without copying content.
+     * Mirrors sdsMakeRoomForNonGreedy() — exact size, no doubling.
+     */
+    public Sds makeRoomFor(int addLen) {
+        if (this.alloc - this.len >= addLen) return this;
+        int newLen = this.len + addLen;
+        byte[] newBuf = new byte[newLen];
+        System.arraycopy(this.buf, 0, newBuf, 0, this.len);
+        return new Sds(newBuf, this.len);
+    }
+
+    // ---- Greedy allocation (mirrors _sdsMakeRoomFor greedy=1) ----
+
+    private static long greedyAlloc(long newLen) {
+        // Don't use TYPE_5 when making room (can't track alloc)
+        long alloc = newLen;
+        if (alloc < SDS_MAX_PREALLOC) {
+            alloc *= 2;
+        } else {
+            alloc += SDS_MAX_PREALLOC;
+        }
+        return alloc;
+    }
+
     // ---- Accessors ----
+
+    public int getLen()   { return len; }
+    public int getAlloc() { return alloc; }
+    public int getType()  { return type; }
 
     public String toStr() {
         return new String(buf, 0, len, StandardCharsets.UTF_8);
@@ -121,20 +172,12 @@ public final class Sds {
         return Arrays.copyOf(buf, len);
     }
 
-    public boolean isEmpty() {
-        return len == 0;
-    }
+    public boolean isEmpty() { return len == 0; }
 
-    /** Returns the number of used bytes (same as {@code getLen()}). */
-    public int length() {
-        return len;
-    }
+    public int length() { return len; }
 
-    // ---- Comparison ----
+    // ---- Comparison (mirrors sdscmp()) ----
 
-    /**
-     * Lexicographic byte comparison (like Redis sdscmp).
-     */
     public int compareTo(Sds other) {
         int minLen = Math.min(this.len, other.len);
         for (int i = 0; i < minLen; i++) {
@@ -159,14 +202,13 @@ public final class Sds {
     @Override
     public int hashCode() {
         int result = 1;
-        for (int i = 0; i < len; i++) {
-            result = 31 * result + buf[i];
-        }
+        for (int i = 0; i < len; i++) result = 31 * result + buf[i];
         return result;
     }
 
     @Override
     public String toString() {
-        return "Sds{len=" + len + ", alloc=" + alloc + ", content=\"" + toStr() + "\"}";
+        return "Sds{len=" + len + ", alloc=" + alloc
+                + ", type=" + type + ", content=\"" + toStr() + "\"}";
     }
 }

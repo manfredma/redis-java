@@ -88,6 +88,10 @@ public final class GossipManager {
 
     public void start() throws IOException {
         int busPort = self.getPort() + 10000;
+        if (busPort > 65535) {
+            log.warn("Cluster bus port {} is out of range (port {} + 10000), Gossip disabled", busPort, self.getPort());
+            return;
+        }
 
         busChannel = ServerSocketChannel.open();
         busChannel.configureBlocking(false);

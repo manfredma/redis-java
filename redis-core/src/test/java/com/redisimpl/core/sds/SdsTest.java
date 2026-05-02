@@ -131,7 +131,6 @@ class SdsTest {
 
     @Test
     void append_largeData_growsCorrectly() {
-        // Build a 1MB string
         byte[] mb = new byte[1024 * 1024];
         java.util.Arrays.fill(mb, (byte) 'x');
         Sds s = Sds.fromBytes(mb);
@@ -139,7 +138,62 @@ class SdsTest {
         java.util.Arrays.fill(extra, (byte) 'y');
         Sds result = s.append(extra);
         assertEquals(mb.length + extra.length, result.length());
-        // After 1MB, growth should be +1MB (not double)
         assertTrue(result.getAlloc() <= result.length() + 1024 * 1024 + 1);
+    }
+
+    @Test
+    void sdsReqType_type5_forLenLessThan32() {
+        assertEquals(Sds.SDS_TYPE_5, Sds.sdsReqType(0));
+        assertEquals(Sds.SDS_TYPE_5, Sds.sdsReqType(1));
+        assertEquals(Sds.SDS_TYPE_5, Sds.sdsReqType(31));
+    }
+
+    @Test
+    void sdsReqType_type8_forLen32to255() {
+        assertEquals(Sds.SDS_TYPE_8, Sds.sdsReqType(32));
+        assertEquals(Sds.SDS_TYPE_8, Sds.sdsReqType(255));
+    }
+
+    @Test
+    void sdsReqType_type16_forLen256to65535() {
+        assertEquals(Sds.SDS_TYPE_16, Sds.sdsReqType(256));
+        assertEquals(Sds.SDS_TYPE_16, Sds.sdsReqType(65535));
+    }
+
+    @Test
+    void sdsReqType_type32_forLen65536to4GB() {
+        assertEquals(Sds.SDS_TYPE_32, Sds.sdsReqType(65536));
+        assertEquals(Sds.SDS_TYPE_32, Sds.sdsReqType((1L << 32) - 1));
+    }
+
+    @Test
+    void sdsReqType_type64_forLenAbove4GB() {
+        assertEquals(Sds.SDS_TYPE_64, Sds.sdsReqType(1L << 32));
+    }
+
+    @Test
+    void fromString_type_matchesReqType() {
+        assertEquals(Sds.SDS_TYPE_5, Sds.fromString("hello").getType());
+        assertEquals(Sds.SDS_TYPE_8, Sds.fromBytes(new byte[32]).getType());
+        assertEquals(Sds.SDS_TYPE_16, Sds.fromBytes(new byte[256]).getType());
+    }
+
+    @Test
+    void greedyGrowth_belowPrealloc_doubles() {
+        Sds s = Sds.fromString("hello");
+        Sds grown = s.append(new byte[10]);
+        int newLen = 5 + 10;
+        assertTrue(grown.getAlloc() >= newLen * 2,
+                "alloc=" + grown.getAlloc() + " expected >= " + (newLen * 2));
+    }
+
+    @Test
+    void greedyGrowth_abovePrealloc_addsOneMB() {
+        byte[] big = new byte[1024 * 1024 + 1];
+        Sds s = Sds.fromBytes(big);
+        Sds grown = s.append(new byte[100]);
+        long newLen = big.length + 100;
+        assertTrue(grown.getAlloc() >= newLen);
+        assertTrue(grown.getAlloc() <= newLen + 1024 * 1024L + 1024);
     }
 }

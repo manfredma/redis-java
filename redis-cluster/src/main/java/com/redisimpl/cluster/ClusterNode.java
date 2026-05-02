@@ -92,7 +92,7 @@ public final class ClusterNode {
         gossipManager = new GossipManager(this);
         try {
             gossipManager.start();
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.warn("Could not start cluster bus on port {}: {}",
                     selfInfo.getPort() + 10000, e.getMessage());
         }

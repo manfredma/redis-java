@@ -131,6 +131,27 @@ public final class ZSetCommands {
         return ((ZSetData) obj.getPtr()).dict.size();
     }
 
+    // Alias used by zmpopGeneric
+    private static long zsetLen(RedisObject obj) { return zsetCard(obj); }
+
+    /** Pop the minimum-score entry. Mirrors zpopminCommand internals. */
+    private static ZSetEntry zsetPopMin(RedisObject obj) {
+        List<ZSetEntry> entries = zsetRangeByRank(obj, 0, 0, false);
+        if (entries.isEmpty()) return null;
+        ZSetEntry e = entries.get(0);
+        zsetDelete(obj, e.member);
+        return e;
+    }
+
+    /** Pop the maximum-score entry. */
+    private static ZSetEntry zsetPopMax(RedisObject obj) {
+        List<ZSetEntry> entries = zsetRangeByRank(obj, -1, -1, false);
+        if (entries.isEmpty()) return null;
+        ZSetEntry e = entries.get(0);
+        zsetDelete(obj, e.member);
+        return e;
+    }
+
     private static long zsetRank(RedisObject obj, byte[] member, boolean rev) {
         if (obj.getEncoding() == RedisObjectConstants.OBJ_ENCODING_LISTPACK) {
             ListPack lp = (ListPack) obj.getPtr();
@@ -664,6 +685,86 @@ public final class ZSetCommands {
         for (ZSetEntry e : entries) zsetAdd(dst, e.score, e.member);
         db.setKey(argv[1], dst);
         return RespEncoder.encodeInteger(entries.size());
+    }
+
+    /**
+     * ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]
+     *
+     * Pops count elements from the first non-empty key.
+     * Mirrors zmpopCommand() → zmpopGenericCommand() in t_zset.c.
+     */
+    @RedisCommand(name = "zmpop", arity = -4, flags = "write fast", firstKey = 2, lastKey = 2, step = 1)
+    public byte[] zmpop(RedisClient client, byte[][] argv) {
+        return zmpopGeneric(client, argv, 1, false);
+    }
+
+    /**
+     * BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]
+     *
+     * Non-blocking mode: if data available, pops immediately.
+     * Mirrors bzmpopCommand() → zmpopGenericCommand() in t_zset.c.
+     */
+    @RedisCommand(name = "bzmpop", arity = -5, flags = "write noscript", firstKey = 3, lastKey = 3, step = 1)
+    public byte[] bzmpop(RedisClient client, byte[][] argv) {
+        return zmpopGeneric(client, argv, 2, true);
+    }
+
+    /**
+     * Shared implementation for ZMPOP and BZMPOP.
+     * @param numkeysIdx  index of numkeys in argv
+     * @param isBlock     true for BZMPOP (timeout at argv[1])
+     */
+    private byte[] zmpopGeneric(RedisClient client, byte[][] argv, int numkeysIdx, boolean isBlock) {
+        int numKeys;
+        try { numKeys = (int) Long.parseLong(toStr(argv[numkeysIdx])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+        if (numKeys <= 0) throw new RedisException("ERR numkeys should be greater than 0");
+
+        int whereIdx = numkeysIdx + numKeys + 1;
+        if (whereIdx >= argv.length) throw RedisException.syntax();
+
+        String whereStr = toStr(argv[whereIdx]).toUpperCase();
+        boolean min;
+        if (whereStr.equals("MIN"))      min = true;
+        else if (whereStr.equals("MAX")) min = false;
+        else throw RedisException.syntax();
+
+        long count = 1;
+        for (int j = whereIdx + 1; j < argv.length; j++) {
+            String opt = toStr(argv[j]).toUpperCase();
+            if (opt.equals("COUNT") && j + 1 < argv.length) {
+                try { count = Long.parseLong(toStr(argv[++j])); }
+                catch (NumberFormatException e) { throw RedisException.notInteger(); }
+                if (count <= 0) throw new RedisException("ERR count should be greater than 0");
+            } else {
+                throw RedisException.syntax();
+            }
+        }
+
+        RedisDb db = db(client);
+        for (int k = 0; k < numKeys; k++) {
+            byte[] key = argv[numkeysIdx + 1 + k];
+            RedisObject obj = db.lookupKeyOrReply(key, RedisObjectConstants.OBJ_TYPE_ZSET);
+            if (obj == null || zsetLen(obj) == 0) continue;
+
+            List<ZSetEntry> popped = new ArrayList<>();
+            for (long i = 0; i < count && zsetLen(obj) > 0; i++) {
+                ZSetEntry e = min ? zsetPopMin(obj) : zsetPopMax(obj);
+                if (e != null) popped.add(e);
+            }
+            if (zsetLen(obj) == 0) db.delete(key);
+
+            List<Object> result = new ArrayList<>();
+            result.add(key);
+            List<Object> members = new ArrayList<>();
+            for (ZSetEntry e : popped) {
+                members.add(e.member);
+                members.add(toBytes(formatScore(e.score)));
+            }
+            result.add(RespEncoder.encodeArray(members));
+            return RespEncoder.encodeArray(result);
+        }
+        return RespEncoder.encodeArray(null);
     }
 
     // ---- Encoding helper ----

@@ -163,10 +163,14 @@ class GossipTest {
     // ---- helpers ----
 
     private static int freePort() throws IOException {
-        try (ServerSocket s = new ServerSocket(0)) {
-            s.setReuseAddress(true);
-            return s.getLocalPort();
+        for (int attempt = 0; attempt < 100; attempt++) {
+            int p = 10000 + new java.util.Random().nextInt(45000);
+            try (ServerSocket s = new ServerSocket(p)) {
+                s.setReuseAddress(true);
+                return p;
+            } catch (IOException ignored) {}
         }
+        throw new IOException("Could not find free port in range 10000-55000");
     }
 
     private static void waitForPort(int port, long ms) throws Exception {

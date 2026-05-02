@@ -420,4 +420,138 @@ public final class ListCommands {
         }
         return RespEncoder.encodeArray(null);
     }
+
+    /**
+     * LPOS key element [RANK rank] [COUNT num-matches] [MAXLEN len]
+     *
+     * Mirrors lposCommand() in t_list.c.
+     * rank:    which match to return (1=first, 2=second, negative=from tail)
+     * count:   return array of up to count matches; 0=all; -1=not given (return single)
+     * maxlen:  scan at most maxlen elements; 0=all
+     */
+    @RedisCommand(name = "lpos", arity = -3, flags = "read-only", firstKey = 1, lastKey = 1, step = 1)
+    public byte[] lpos(RedisClient client, byte[][] argv) {
+        RedisDb db = db(client);
+        byte[] ele = argv[2];
+
+        long rank = 1;
+        long count = -1;   // -1 means not given → return single integer
+        long maxlen = 0;   // 0 = no limit
+        boolean fromTail = false;
+
+        for (int j = 3; j < argv.length; j++) {
+            String opt = toStr(argv[j]).toUpperCase();
+            if ((opt.equals("RANK") || opt.equals("COUNT") || opt.equals("MAXLEN"))
+                    && j + 1 >= argv.length) {
+                throw RedisException.syntax();
+            }
+            if (opt.equals("RANK")) {
+                rank = Long.parseLong(toStr(argv[++j]));
+                if (rank == 0)
+                    throw new RedisException(
+                            "ERR RANK can't be zero: use 1 to start from the first match, "
+                                    + "2 from the second ... or use negative to start from the end of the list");
+            } else if (opt.equals("COUNT")) {
+                count = Long.parseLong(toStr(argv[++j]));
+                if (count < 0) throw new RedisException("ERR COUNT can't be negative");
+            } else if (opt.equals("MAXLEN")) {
+                maxlen = Long.parseLong(toStr(argv[++j]));
+                if (maxlen < 0) throw new RedisException("ERR MAXLEN can't be negative");
+            } else {
+                throw RedisException.syntax();
+            }
+        }
+
+        if (rank < 0) {
+            rank = -rank;
+            fromTail = true;
+        }
+
+        RedisObject obj = db.lookupKeyOrReply(argv[1], RedisObjectConstants.OBJ_TYPE_LIST);
+        if (obj == null) {
+            return (count != -1) ? RespEncoder.EMPTY_ARRAY : RespEncoder.NULL_BULK;
+        }
+
+        List<byte[]> all = listRange(obj, 0, -1);
+        long llen = all.size();
+        List<Long> matches = new ArrayList<>();
+        long scanned = 0;
+        long rankCount = 0;
+
+        for (int i = 0; i < llen; i++) {
+            int idx = fromTail ? (int)(llen - 1 - i) : i;
+            if (maxlen > 0 && scanned >= maxlen) break;
+            scanned++;
+            if (Arrays.equals(all.get(idx), ele)) {
+                rankCount++;
+                if (rankCount >= rank) {
+                    matches.add(fromTail ? (llen - 1 - i) : (long) i);
+                    if (count != -1 && count > 0 && matches.size() >= count) break;
+                    if (count == -1) break; // only first match needed
+                }
+            }
+        }
+
+        if (count == -1) {
+            // Return single or null
+            if (matches.isEmpty()) return RespEncoder.NULL_BULK;
+            return RespEncoder.encodeInteger(matches.get(0));
+        } else {
+            // Return array
+            List<Object> result = new ArrayList<>();
+            for (Long m : matches) result.add(m);
+            return RespEncoder.encodeArray(result);
+        }
+    }
+
+    /**
+     * BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]
+     *
+     * Non-blocking version (timeout is ignored if data is available).
+     * Mirrors blmpopCommand() → zmpopGenericCommand() logic in t_list.c.
+     */
+    @RedisCommand(name = "blmpop", arity = -5, flags = "write noscript", firstKey = 3, lastKey = 3, step = 1)
+    public byte[] blmpop(RedisClient client, byte[][] argv) {
+        // argv: blmpop timeout numkeys key [key...] LEFT|RIGHT [COUNT count]
+        // timeout is argv[1], numkeys is argv[2]
+        int numKeys;
+        try { numKeys = (int) Long.parseLong(toStr(argv[2])); }
+        catch (NumberFormatException e) { throw RedisException.notInteger(); }
+        if (numKeys <= 0) throw new RedisException("ERR numkeys must be a positive integer");
+        if (argv.length < 4 + numKeys) throw RedisException.syntax();
+
+        String dir = toStr(argv[3 + numKeys]).toUpperCase();
+        if (!dir.equals("LEFT") && !dir.equals("RIGHT")) throw RedisException.syntax();
+        boolean fromLeft = dir.equals("LEFT");
+
+        int count = 1;
+        if (argv.length > 4 + numKeys) {
+            String opt = toStr(argv[4 + numKeys]).toUpperCase();
+            if (!opt.equals("COUNT")) throw RedisException.syntax();
+            if (argv.length < 6 + numKeys) throw RedisException.syntax();
+            try { count = (int) Long.parseLong(toStr(argv[5 + numKeys])); }
+            catch (NumberFormatException e) { throw RedisException.notInteger(); }
+            if (count <= 0) throw new RedisException("ERR count should be greater than 0");
+        }
+
+        RedisDb db = db(client);
+        for (int k = 0; k < numKeys; k++) {
+            byte[] key = argv[3 + k];
+            RedisObject obj = db.lookupKeyOrReply(key, RedisObjectConstants.OBJ_TYPE_LIST);
+            if (obj != null && listLen(obj) > 0) {
+                List<Object> popped = new ArrayList<>();
+                for (int i = 0; i < count && listLen(obj) > 0; i++) {
+                    popped.add(listPop(obj, fromLeft));
+                }
+                if (listLen(obj) == 0) db.delete(key);
+
+                List<Object> result = new ArrayList<>();
+                result.add(key);
+                result.add(RespEncoder.encodeArray(popped));
+                return RespEncoder.encodeArray(result);
+            }
+        }
+        // No data available — in a real implementation we would block
+        return RespEncoder.encodeArray(null);
+    }
 }

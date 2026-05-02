@@ -50,9 +50,9 @@ class ClusterTest {
         node3.registerPeer(node1);
         node3.registerPeer(node2);
 
-        Thread t1 = new Thread(() -> { try { node1.start(); } catch (Exception ignored) {} });
-        Thread t2 = new Thread(() -> { try { node2.start(); } catch (Exception ignored) {} });
-        Thread t3 = new Thread(() -> { try { node3.start(); } catch (Exception ignored) {} });
+        Thread t1 = new Thread(() -> { try { node1.start(); } catch (Exception e) { e.printStackTrace(); } });
+        Thread t2 = new Thread(() -> { try { node2.start(); } catch (Exception e) { e.printStackTrace(); } });
+        Thread t3 = new Thread(() -> { try { node3.start(); } catch (Exception e) { e.printStackTrace(); } });
         t1.setDaemon(true); t2.setDaemon(true); t3.setDaemon(true);
         t1.start(); t2.start(); t3.start();
 
@@ -167,10 +167,15 @@ class ClusterTest {
     // ---- helpers ----
 
     private static int freePort() throws IOException {
-        try (ServerSocket s = new ServerSocket(0)) {
-            s.setReuseAddress(true);
-            return s.getLocalPort();
+        // Use ports in range 10000-55000 so bus port (port+10000) stays <= 65535
+        for (int attempt = 0; attempt < 100; attempt++) {
+            int p = 10000 + new java.util.Random().nextInt(45000);
+            try (ServerSocket s = new ServerSocket(p)) {
+                s.setReuseAddress(true);
+                return p;
+            } catch (IOException ignored) {}
         }
+        throw new IOException("Could not find free port in range 10000-55000");
     }
 
     private static void waitForPort(int port, long ms) throws Exception {

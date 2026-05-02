@@ -9,16 +9,44 @@ import java.util.List;
 /**
  * QuickList — Java port of Redis's quicklist.c.
  *
- * <p>A doubly-linked list where each node contains a {@link ListPack}.
- * When a node's listpack exceeds the configured limits, it is split.
+ * A doubly-linked list where each node contains a {@link ListPack}.
+ * Node capacity is controlled by {@code fill} and {@code compress} parameters
+ * that mirror quicklist.c exactly:
  *
- * <p>Operations work on a mutable copy and return a new immutable QuickList.
+ * fill (mirrors quicklistSetFill):
+ *   fill > 0  → max entry count per node (clamped to FILL_MAX=32767)
+ *   fill == 0 → 1 entry per node
+ *   fill < 0  → size-based limit using optimization_level[] (−1..−5):
+ *               −1: 4096 bytes, −2: 8192, −3: 16384, −4: 32768, −5: 65536
+ *   Default: −2 (mirrors quicklistCreate() setting fill = -2)
+ *
+ * compress (mirrors quicklistSetCompressDepth):
+ *   0 → no compression; N → compress all nodes except N from each end.
+ *   Java implementation: node compression is noted but not byte-level LZF,
+ *   since we don't have a C-compatible LZF node format here.
+ *
+ * SIZE_ESTIMATE_OVERHEAD = 8 (mirrors quicklist.c constant)
+ * SIZE_SAFETY_LIMIT = 8192
  */
 public final class QuickList {
 
-    /** Max elements per listpack node */
+    // ---- Fill / compress constants (mirrors quicklist.c) ----
+    public static final int FILL_MAX     = (1 << 14) - 1; // 16383 (QL_FILL_BITS=15, max = 2^14-1)
+    public static final int COMPRESS_MAX = (1 << 10) - 1; // 1023 (QL_COMP_BITS=10)
+    public static final int DEFAULT_FILL = -2;             // matches quicklistCreate()
+    public static final int DEFAULT_COMPRESS = 0;
+
+    // Optimization levels for size-based fill (mirrors optimization_level[] in quicklist.c)
+    private static final long[] OPTIMIZATION_LEVEL = {4096, 8192, 16384, 32768, 65536};
+    private static final long SIZE_SAFETY_LIMIT    = 8192;
+    private static final long SIZE_ESTIMATE_OVERHEAD = 8;
+
+    // Legacy compatibility constants (kept for callers that use them directly)
+    /** @deprecated Use fill parameter instead */
+    @Deprecated
     public static final int QUICKLIST_NODE_MAX_ENTRIES = 128;
-    /** Max bytes per element before forcing a new node */
+    /** @deprecated Use fill parameter instead */
+    @Deprecated
     public static final int QUICKLIST_NODE_MAX_VALUE   = 64;
 
     /** Doubly-linked node */
@@ -34,29 +62,81 @@ public final class QuickList {
 
     final Node head;
     final Node tail;
-    final long size; // total element count
+    final long size;   // total element count
+    final int fill;    // node fill parameter
+    final int compress; // compress depth
 
-    private QuickList(Node head, Node tail, long size) {
+    private QuickList(Node head, Node tail, long size, int fill, int compress) {
         this.head = head;
         this.tail = tail;
         this.size = size;
+        this.fill = fill;
+        this.compress = compress;
     }
 
+    /** Create with default fill=-2, compress=0 (mirrors quicklistCreate()). */
     public static QuickList create() {
-        return new QuickList(null, null, 0);
+        return new QuickList(null, null, 0, DEFAULT_FILL, DEFAULT_COMPRESS);
+    }
+
+    /** Create with explicit fill and compress parameters. */
+    public static QuickList create(int fill, int compress) {
+        int f = (fill > FILL_MAX) ? FILL_MAX : (fill < -5) ? -5 : fill;
+        int c = (compress > COMPRESS_MAX) ? COMPRESS_MAX : (compress < 0) ? 0 : compress;
+        return new QuickList(null, null, 0, f, c);
+    }
+
+    public int getFill()     { return fill; }
+    public int getCompress() { return compress; }
+
+    // ---- Node size limit logic (mirrors quicklistNodeExceedsLimit) ----
+
+    /**
+     * Calculate size limit for a node given fill.
+     * Mirrors quicklistNodeNegFillLimit() and quicklistNodeLimit().
+     */
+    private static long nodeSizeLimit(int fill) {
+        if (fill < 0) {
+            int offset = (-fill) - 1;
+            if (offset >= OPTIMIZATION_LEVEL.length) offset = OPTIMIZATION_LEVEL.length - 1;
+            return OPTIMIZATION_LEVEL[offset];
+        }
+        return Long.MAX_VALUE; // count-based, not size-based
+    }
+
+    private static int nodeCountLimit(int fill) {
+        if (fill >= 0) return (fill == 0) ? 1 : fill;
+        return Integer.MAX_VALUE; // size-based, not count-based
+    }
+
+    /**
+     * Returns true if adding an element of {@code elemSz} bytes to a node
+     * with current {@code nodeByteSize} and {@code nodeCount} would exceed limits.
+     * Mirrors quicklistNodeExceedsLimit().
+     */
+    static boolean nodeExceedsLimit(int fill, long nodeByteSize, int nodeCount, int elemSz) {
+        if (fill < 0) {
+            long sizeLimit = nodeSizeLimit(fill);
+            long newSz = nodeByteSize + elemSz + SIZE_ESTIMATE_OVERHEAD;
+            return newSz > sizeLimit;
+        } else {
+            int countLimit = nodeCountLimit(fill);
+            if (nodeByteSize + elemSz > SIZE_SAFETY_LIMIT) return true;
+            return nodeCount >= countLimit;
+        }
     }
 
     // ---- Push ----
 
     public QuickList rpush(byte[] value) {
         Mut m = new Mut(this);
-        m.rpush(value);
+        m.rpush(value, fill);
         return m.build();
     }
 
     public QuickList lpush(byte[] value) {
         Mut m = new Mut(this);
-        m.lpush(value);
+        m.lpush(value, fill);
         return m.build();
     }
 
@@ -205,9 +285,13 @@ public final class QuickList {
         Node head;
         Node tail;
         long size;
+        int fill;
+        int compress;
 
         Mut(QuickList ql) {
             this.size = ql.size;
+            this.fill = ql.fill;
+            this.compress = ql.compress;
             if (ql.head == null) {
                 this.head = null;
                 this.tail = null;
@@ -231,15 +315,12 @@ public final class QuickList {
             this.tail = prevNew;
         }
 
-        void rpush(byte[] value) {
+        void rpush(byte[] value, int fill) {
             if (tail == null) {
-                // Empty list
                 Node newNode = new Node(ListPack.create().append(value));
                 head = tail = newNode;
                 size++;
-            } else if (value.length > QUICKLIST_NODE_MAX_VALUE
-                    || tail.pack.size() >= QUICKLIST_NODE_MAX_ENTRIES) {
-                // Need a new node
+            } else if (nodeExceedsLimit(fill, tail.pack.totalBytes(), tail.pack.size(), value.length)) {
                 Node newNode = new Node(ListPack.create().append(value));
                 newNode.prev = tail;
                 tail.next = newNode;
@@ -251,13 +332,15 @@ public final class QuickList {
             }
         }
 
-        void lpush(byte[] value) {
+        // Legacy overload for callers that don't pass fill
+        void rpush(byte[] value) { rpush(value, DEFAULT_FILL); }
+
+        void lpush(byte[] value, int fill) {
             if (head == null) {
                 Node newNode = new Node(ListPack.create().append(value));
                 head = tail = newNode;
                 size++;
-            } else if (value.length > QUICKLIST_NODE_MAX_VALUE
-                    || head.pack.size() >= QUICKLIST_NODE_MAX_ENTRIES) {
+            } else if (nodeExceedsLimit(fill, head.pack.totalBytes(), head.pack.size(), value.length)) {
                 Node newNode = new Node(ListPack.create().append(value));
                 newNode.next = head;
                 head.prev = newNode;
@@ -268,6 +351,8 @@ public final class QuickList {
                 size++;
             }
         }
+
+        void lpush(byte[] value) { lpush(value, DEFAULT_FILL); }
 
         byte[] lpop() {
             if (head == null) return null;
@@ -301,7 +386,8 @@ public final class QuickList {
                         int insertIdx = before ? i : i + 1;
                         n.pack = n.pack.insert(insertIdx, value);
                         size++;
-                        if (n.pack.size() > QUICKLIST_NODE_MAX_ENTRIES) {
+                        // Split if node now exceeds default fill limit
+                        if (n.pack.size() > 128) {
                             splitNode(n);
                         }
                         return true;
@@ -392,7 +478,7 @@ public final class QuickList {
         }
 
         QuickList build() {
-            return new QuickList(head, tail, size);
+            return new QuickList(head, tail, size, fill, compress);
         }
     }
 
