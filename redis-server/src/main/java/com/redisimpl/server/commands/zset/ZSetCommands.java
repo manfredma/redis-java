@@ -761,7 +761,7 @@ public final class ZSetCommands {
                 members.add(e.member);
                 members.add(toBytes(formatScore(e.score)));
             }
-            result.add(RespEncoder.encodeArray(members));
+            result.add(members);  // nested array, not pre-encoded bytes
             return RespEncoder.encodeArray(result);
         }
         return RespEncoder.encodeArray(null);

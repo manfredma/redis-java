@@ -19,6 +19,8 @@ public final class RedisObjectConstants {
     public static final int OBJ_TYPE_ZSET   = 3;
     /** Hash object */
     public static final int OBJ_TYPE_HASH   = 4;
+    /** Stream object (Redis 5+) */
+    public static final int OBJ_TYPE_STREAM = 6;
 
     // ---- Object encodings ----
     /** Raw SDS string */
@@ -39,6 +41,8 @@ public final class RedisObjectConstants {
     public static final int OBJ_ENCODING_QUICKLIST  = 9;
     /** List pack (compact list) */
     public static final int OBJ_ENCODING_LISTPACK   = 11;
+    /** Stream encoding */
+    public static final int OBJ_ENCODING_STREAM     = 14;
 
     // ---- LRU clock ----
     /** LRU clock resolution in milliseconds */

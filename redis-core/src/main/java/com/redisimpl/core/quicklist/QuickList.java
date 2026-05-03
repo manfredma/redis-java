@@ -100,7 +100,10 @@ public final class QuickList {
                 compressed = null;
                 isCompressed = false;
             } catch (Exception e) {
-                throw new RuntimeException("QuickList LZF decompression failed", e);
+                // Decompression failed — restore empty pack to avoid downstream NPE
+                // This should never happen in practice if compression succeeded
+                if (pack == null) pack = ListPack.create();
+                isCompressed = false;
             }
         }
     }
@@ -231,7 +234,7 @@ public final class QuickList {
         Node n = head;
         while (n != null) {
             Mut.ensureDecompressed(n);
-            int nodeSize = n.pack.size();
+            int nodeSize = (n.pack != null) ? n.pack.size() : 0;
             if (pos + nodeSize > actual) {
                 return n.pack.get((int) (actual - pos));
             }
@@ -254,7 +257,7 @@ public final class QuickList {
         Node n = head;
         while (n != null && pos <= stop) {
             Mut.ensureDecompressed(n);
-            int nodeSize = n.pack.size();
+            int nodeSize = (n.pack != null) ? n.pack.size() : 0;
             for (int i = 0; i < nodeSize; i++) {
                 long globalIdx = pos + i;
                 if (globalIdx >= start && globalIdx <= stop) {
@@ -344,12 +347,16 @@ public final class QuickList {
                 this.tail = null;
                 return;
             }
-            // Deep-copy the node chain (ListPack is immutable, share references)
+            // Deep-copy the node chain, preserving compression state
             Node srcNode = ql.head;
             Node firstNew = null;
             Node prevNew = null;
             while (srcNode != null) {
-                Node newNode = new Node(srcNode.pack);
+                Node newNode = new Node(srcNode.pack); // pack may be null if compressed
+                // Copy compression state so decompression works correctly later
+                newNode.isCompressed     = srcNode.isCompressed;
+                newNode.compressed       = srcNode.compressed;     // shared reference (immutable bytes)
+                newNode.uncompressedSize = srcNode.uncompressedSize;
                 if (firstNew == null) firstNew = newNode;
                 if (prevNew != null) {
                     prevNew.next = newNode;

@@ -64,6 +64,11 @@ public final class RespEncoder {
                     out.write(encodeBulkString(((String) item).getBytes(StandardCharsets.UTF_8)));
                 } else if (item instanceof Long || item instanceof Integer) {
                     out.write(encodeInteger(((Number) item).longValue()));
+                } else if (item instanceof List) {
+                    // Nested array — encode recursively
+                    @SuppressWarnings("unchecked")
+                    List<Object> nested = (List<Object>) item;
+                    out.write(encodeArray(nested));
                 } else {
                     out.write(encodeBulkString(item.toString().getBytes(StandardCharsets.UTF_8)));
                 }

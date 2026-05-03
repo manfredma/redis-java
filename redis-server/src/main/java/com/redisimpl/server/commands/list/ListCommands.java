@@ -372,7 +372,7 @@ public final class ListCommands {
 
             List<Object> result = new ArrayList<>();
             result.add(key);
-            result.add(RespEncoder.encodeArray(popped));
+            result.add(popped);
             return RespEncoder.encodeArray(result);
         }
         return RespEncoder.encodeArray(null); // null array
@@ -547,7 +547,7 @@ public final class ListCommands {
 
                 List<Object> result = new ArrayList<>();
                 result.add(key);
-                result.add(RespEncoder.encodeArray(popped));
+                result.add(popped);
                 return RespEncoder.encodeArray(result);
             }
         }

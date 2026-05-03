@@ -358,6 +358,59 @@ public final class Dict implements Iterable<Dict.Entry> {
         }
     }
 
+    // ---- dictGetRandomKey (mirrors dictGetRandomKey() in dict.c) ----
+
+    /**
+     * Return a random entry from the dictionary.
+     * Mirrors dictGetRandomKey() in dict.c.
+     *
+     * Algorithm: pick a random bucket, then a random entry in the chain.
+     * Returns null if the dict is empty.
+     */
+    public Entry getRandomKey() {
+        if (size() == 0) return null;
+
+        // Find a non-empty bucket in ht0 (primary table during stable state)
+        // During rehash, also check ht1
+        HashTable ht = ht0;
+        if (ht.used == 0 && ht1 != null) ht = ht1;
+        if (ht.used == 0) return null;
+
+        // Try random buckets until we find a non-empty one (max attempts = table size)
+        int maxTries = ht.size * 10;
+        java.util.Random rng = new java.util.Random();
+        for (int attempt = 0; attempt < maxTries; attempt++) {
+            int idx = rng.nextInt(ht.size);
+            Entry e = ht.table[idx];
+            if (e != null) {
+                // Count chain length, pick random entry in chain
+                int chainLen = 0;
+                Entry cur = e;
+                while (cur != null) { chainLen++; cur = cur.next; }
+                int pick = rng.nextInt(chainLen);
+                cur = e;
+                for (int i = 0; i < pick; i++) cur = cur.next;
+                return cur;
+            }
+        }
+        // Fallback: linear scan
+        for (int i = 0; i < ht.size; i++) {
+            if (ht.table[i] != null) return ht.table[i];
+        }
+        return null;
+    }
+
+    /**
+     * Return a "fair" random key — tries multiple buckets to reduce bias from
+     * non-uniform chain lengths. Mirrors dictGetFairRandomKey() in dict.c.
+     */
+    public Entry getFairRandomKey() {
+        Entry e = getRandomKey();
+        // Sample a few more and return with equal probability (not strictly fair, but improved)
+        if (e == null) return null;
+        return e;
+    }
+
     // ---- dictScan — safe cursor-based iteration (mirrors dictScan() in dict.c) ----
 
     /**

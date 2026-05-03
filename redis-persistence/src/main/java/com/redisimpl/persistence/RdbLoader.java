@@ -174,6 +174,9 @@ public final class RdbLoader {
             case RdbSaver.RDB_TYPE_ZSET_ZIPLIST:
                 return readZSetListpack(in);
 
+            case RdbSaver.RDB_TYPE_STREAM_LISTPACKS:
+                return readStream(in);
+
             default:
                 throw new IOException("Unknown RDB type: " + type);
         }
@@ -305,6 +308,78 @@ public final class RdbLoader {
                 RedisObjectConstants.OBJ_TYPE_ZSET,
                 RedisObjectConstants.OBJ_ENCODING_LISTPACK,
                 lp);
+    }
+
+    /**
+     * Read a Stream object from RDB.
+     * Mirrors the RDB_TYPE_STREAM_LISTPACKS load path in rdb.c.
+     *
+     * Our simplified format (written by writeStream):
+     *   N_listpacks → for each: id_bytes + fields_bytes
+     *   length + last_ms + last_seq + first_ms + first_seq + max_del_ms + max_del_seq + entries_added
+     *   N_groups → for each: name + last_ms + last_seq + entries_read + pel_count + N_consumers
+     *     each consumer: name + seen_time + active_time + pel_count
+     */
+    @SuppressWarnings("unchecked")
+    private RedisObject readStream(DataInputStream in) throws IOException {
+        com.redisimpl.server.commands.stream.StreamObject stream =
+                new com.redisimpl.server.commands.stream.StreamObject();
+
+        long nEntries = readRdbLen(in);
+        for (long i = 0; i < nEntries; i++) {
+            byte[] idBytes = readRdbStringBytes(in);
+            byte[] fieldsBytes = readRdbStringBytes(in);
+            String id = new String(idBytes, java.nio.charset.StandardCharsets.UTF_8);
+
+            java.util.Map<String, String> fields = new java.util.LinkedHashMap<>();
+            java.io.DataInputStream fis = new java.io.DataInputStream(
+                    new java.io.ByteArrayInputStream(fieldsBytes));
+            int fieldCount = fis.read() & 0xFF;
+            for (int fi = 0; fi < fieldCount; fi++) {
+                long flen = readRdbLen(fis);
+                byte[] fb = new byte[(int) flen]; fis.readFully(fb);
+                long vlen = readRdbLen(fis);
+                byte[] vb = new byte[(int) vlen]; fis.readFully(vb);
+                fields.put(new String(fb, java.nio.charset.StandardCharsets.UTF_8),
+                           new String(vb, java.nio.charset.StandardCharsets.UTF_8));
+            }
+            stream.addRdb(id, fields);
+        }
+
+        /* length */        readRdbLen(in);
+        long lastMs  =      readRdbLen(in);
+        long lastSeq =      readRdbLen(in);
+        /* first_id */      readRdbLen(in); readRdbLen(in);
+        /* max_del */       readRdbLen(in); readRdbLen(in);
+        /* entriesAdded */  readRdbLen(in);
+        stream.setLastId(lastMs, lastSeq);
+
+        long nGroups = readRdbLen(in);
+        for (long g = 0; g < nGroups; g++) {
+            String groupName = new String(readRdbStringBytes(in),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            long lastDelMs  = readRdbLen(in);
+            long lastDelSeq = readRdbLen(in);
+            /* entries_read */ readRdbLen(in);
+            /* pel_count */    readRdbLen(in);
+            stream.createGroup(groupName, lastDelMs + "-" + lastDelSeq);
+
+            long nConsumers = readRdbLen(in);
+            for (long c = 0; c < nConsumers; c++) {
+                String consName = new String(readRdbStringBytes(in),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                /* seen_time */   readRdbLen(in);
+                /* active_time */ readRdbLen(in);
+                /* pel_count */   readRdbLen(in);
+                stream.createGroup(groupName, lastDelMs + "-" + lastDelSeq)
+                      .getOrCreateConsumer(consName);
+            }
+        }
+
+        return RedisObject.createObject(
+                RedisObjectConstants.OBJ_TYPE_STREAM,
+                RedisObjectConstants.OBJ_ENCODING_STREAM,
+                stream);
     }
 
     // ---- Low-level decoding helpers ----

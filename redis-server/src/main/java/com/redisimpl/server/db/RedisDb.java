@@ -217,14 +217,24 @@ public final class RedisDb {
     /**
      * Return a random key from the database.
      */
+    /**
+     * Return a random non-expired key — mirrors dbRandomKey() in db.c.
+     * Uses dict.getRandomKey() which mirrors dictGetRandomKey() in dict.c.
+     * Retries up to maxAttempts to skip expired keys.
+     */
     public byte[] randomKey() {
-        Set<byte[]> keySet = dict.keySet();
-        if (keySet.isEmpty()) return null;
-        List<byte[]> keys = new ArrayList<>(keySet);
-        // Filter expired
-        keys.removeIf(this::isExpired);
-        if (keys.isEmpty()) return null;
-        return keys.get(new Random().nextInt(keys.size()));
+        if (dict.size() == 0) return null;
+        int maxAttempts = 100;
+        for (int i = 0; i < maxAttempts; i++) {
+            com.redisimpl.core.dict.Dict.Entry e = dict.getRandomKey();
+            if (e == null) return null;
+            byte[] key = e.getKey();
+            if (!isExpired(key)) return key;
+            // Expired — delete lazily and retry
+            delete(key);
+            if (dict.size() == 0) return null;
+        }
+        return null;
     }
 
     /**
@@ -317,15 +327,20 @@ public final class RedisDb {
             int sampled = 0;
             int expired = 0;
 
-            // Use dictScan cursor for fair scan across hash buckets
+            // Use dictScan cursor — advance up to keysPerLoop buckets per iteration
+            // to mirror Redis's expires_cursor-based sampling
             final List<byte[]> expiredKeys = new ArrayList<>();
-            expiresCursor = expires.scan(expiresCursor, (key, value) -> {
-                Long expireAt = (Long) value;
-                if (expireAt != null && now >= expireAt) {
-                    expiredKeys.add(key);
-                }
-            });
-            sampled += keysPerLoop; // approximate
+            for (int s = 0; s < keysPerLoop && expires.size() > 0; s++) {
+                expiresCursor = expires.scan(expiresCursor, (key, value) -> {
+                    Long expireAt = (Long) value;
+                    if (expireAt != null && now >= expireAt) {
+                        expiredKeys.add(key);
+                    }
+                    // Approximate sampled count
+                });
+                sampled++;
+                if (expiresCursor == 0) break; // full cycle done
+            }
 
             for (byte[] key : expiredKeys) {
                 delete(key);

@@ -188,6 +188,37 @@ public final class StreamObject {
         return c != 0 ? c : Long.compare(as, bs);
     }
 
+    /** Set lastMillis/lastSeq directly (used during RDB load). */
+    public void setLastId(long millis, long seq) {
+        this.lastMillis = millis;
+        this.lastSeq    = seq;
+    }
+
+    /**
+     * Create or retrieve a consumer group (used during RDB load).
+     * Returns the group, creating it if needed.
+     */
+    public StreamConsumerGroup createGroup(String name, String lastDeliveredId) {
+        return groups.computeIfAbsent(name, k -> {
+            long[] parts = parseId(lastDeliveredId);
+            return new StreamConsumerGroup(name, parts[0], parts[1]);
+        });
+    }
+
+    /**
+     * Add an entry during RDB load bypassing ID validation.
+     * Mirrors adding a stream entry with explicit ID.
+     */
+    public void addRdb(String id, java.util.Map<String, String> fields) {
+        long[] parts = parseId(id);
+        StreamEntry entry = new StreamEntry(parts[0], parts[1], fields);
+        entries.put(entry.getId(), entry);
+        if (parts[0] > lastMillis || (parts[0] == lastMillis && parts[1] > lastSeq)) {
+            lastMillis = parts[0];
+            lastSeq    = parts[1];
+        }
+    }
+
     public static long[] parseId(String id) {
         if ("-".equals(id)) return new long[]{0, 0};
         if ("+".equals(id)) return new long[]{Long.MAX_VALUE, Long.MAX_VALUE};

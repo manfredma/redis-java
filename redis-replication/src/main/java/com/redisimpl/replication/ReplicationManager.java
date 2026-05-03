@@ -224,6 +224,36 @@ public final class ReplicationManager
     public int getMasterPort()         { return masterPort; }
     public int getReplicaCount()       { return (int) replicas.values().stream()
             .filter(r -> r.getState() == ReplicaInfo.State.ONLINE).count(); }
+
+    /**
+     * Count replicas that have acknowledged offset >= the given offset.
+     * Mirrors replicationCountAcksByOffset() in replication.c.
+     */
+    public long countAckedReplicas(long offset) {
+        return replicas.values().stream()
+                .filter(r -> r.getState() == ReplicaInfo.State.ONLINE
+                        && r.getReplicaOffset() >= offset)
+                .count();
+    }
+
+    /**
+     * Send REPLCONF GETACK * to all online replicas.
+     * Mirrors sendGetackToReplicas() in replication.c.
+     */
+    public void sendGetAckToReplicas() {
+        byte[] getAckCmd = encodeCommand(new byte[][]{
+                "REPLCONF".getBytes(), "GETACK".getBytes(), "*".getBytes()
+        });
+        for (java.util.Map.Entry<SocketChannel, ReplicaInfo> entry : replicas.entrySet()) {
+            if (entry.getValue().getState() == ReplicaInfo.State.ONLINE) {
+                try {
+                    entry.getKey().write(java.nio.ByteBuffer.wrap(getAckCmd));
+                } catch (java.io.IOException e) {
+                    log.debug("Failed to send GETACK to replica: {}", e.getMessage());
+                }
+            }
+        }
+    }
     public Collection<ReplicaInfo> getReplicas() { return replicas.values(); }
 
     public boolean isMasterLinkUp() {

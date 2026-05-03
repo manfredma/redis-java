@@ -63,7 +63,8 @@ public final class RdbSaver {
     static final int RDB_TYPE_SET_INTSET    = 11;
     static final int RDB_TYPE_ZSET_ZIPLIST  = 12; // listpack encoded zset
     static final int RDB_TYPE_HASH_ZIPLIST  = 13; // listpack encoded hash
-    static final int RDB_TYPE_LIST_QUICKLIST2 = 18;
+    static final int RDB_TYPE_LIST_QUICKLIST2   = 18;
+    static final int RDB_TYPE_STREAM_LISTPACKS  = 15; // Stream (basic, used for our impl)
 
     // ---- RDB string encoding special types ----
     static final int RDB_ENC_INT8           = 0;
@@ -225,6 +226,10 @@ public final class RdbSaver {
                 writeZSet(out, key, obj);
                 break;
 
+            case RedisObjectConstants.OBJ_TYPE_STREAM:
+                writeStream(out, key, obj);
+                break;
+
             default:
                 log.warn("Unknown object type {}, skipping key", type);
         }
@@ -347,6 +352,104 @@ public final class RdbSaver {
                 writeRdbString(out, node.getEle());
                 writeDouble(out, node.getScore());
                 node = node.getLevels()[0].forward;
+            }
+        }
+    }
+
+    // ---- Stream ----
+
+    /**
+     * Serialize a Stream object to RDB using RDB_TYPE_STREAM_LISTPACKS format.
+     *
+     * Mirrors the OBJ_STREAM case in rdbSaveObjectLen/rdbSaveObject() in rdb.c.
+     *
+     * Format (RDB_TYPE_STREAM_LISTPACKS = 15):
+     *   type_byte(1) + key_string
+     *   N_listpacks(len)
+     *   for each entry: entry_key_str + listpack_bytes_str
+     *   total_length(len)
+     *   last_id_ms(len) + last_id_seq(len)
+     *   first_id_ms(len) + first_id_seq(len)
+     *   max_deleted_ms(len) + max_deleted_seq(len)
+     *   entries_added(len)
+     *   N_groups(len)
+     *   for each group:
+     *     group_name_str
+     *     last_delivered_ms(len) + last_delivered_seq(len)
+     *     entries_read(len)
+     *     pel_count(len) = 0  (simplified: no PEL serialization)
+     *     N_consumers(len) = 0
+     */
+    @SuppressWarnings("unchecked")
+    private void writeStream(CrcOutputStream out, byte[] key, RedisObject obj) throws IOException {
+        com.redisimpl.server.commands.stream.StreamObject stream =
+                (com.redisimpl.server.commands.stream.StreamObject) obj.getPtr();
+        if (stream == null) return;
+
+        out.write(RDB_TYPE_STREAM_LISTPACKS);
+        writeRdbString(out, key);
+
+        // Serialize all entries as individual "listpack" nodes
+        // In our simplified implementation each entry is one node.
+        // We serialize all entries as a single "master node".
+        java.util.List<com.redisimpl.server.commands.stream.StreamEntry> entries =
+                stream.range("-", "+", Integer.MAX_VALUE);
+
+        // N listpacks — we use 1 node containing all entries serialized as RESP
+        if (entries.isEmpty()) {
+            writeRdbLen(out, 0); // 0 listpacks
+        } else {
+            writeRdbLen(out, entries.size()); // one "node" per entry for simplicity
+            for (com.redisimpl.server.commands.stream.StreamEntry entry : entries) {
+                // key: entry ID as bytes
+                byte[] idBytes = entry.getId().getBytes(StandardCharsets.UTF_8);
+                writeRdbString(out, idBytes);
+                // value: serialized fields as a listpack-like byte sequence
+                // We encode fields as [count, field1, val1, field2, val2, ...]
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                bos.write((byte) entry.getFields().size()); // field count (1 byte)
+                for (java.util.Map.Entry<String, String> f : entry.getFields().entrySet()) {
+                    byte[] fb = f.getKey().getBytes(StandardCharsets.UTF_8);
+                    byte[] vb = f.getValue().getBytes(StandardCharsets.UTF_8);
+                    writeRdbLen(bos, fb.length); bos.write(fb);
+                    writeRdbLen(bos, vb.length); bos.write(vb);
+                }
+                writeRdbString(out, bos.toByteArray());
+            }
+        }
+
+        // stream metadata
+        writeRdbLen(out, stream.size());                        // total length
+        writeRdbLen(out, stream.getLastMillis());               // last_id.ms
+        writeRdbLen(out, stream.getLastSeq());                  // last_id.seq
+        // first_id
+        String firstId = entries.isEmpty() ? "0-0" : entries.get(0).getId();
+        String[] fParts = firstId.split("-");
+        writeRdbLen(out, Long.parseLong(fParts[0]));
+        writeRdbLen(out, Long.parseLong(fParts[1]));
+        // max_deleted_entry_id (0-0 = none)
+        writeRdbLen(out, 0);
+        writeRdbLen(out, 0);
+        // entries_added
+        writeRdbLen(out, stream.size());
+
+        // Consumer groups
+        java.util.Map<String, com.redisimpl.server.commands.stream.StreamConsumerGroup> groups =
+                stream.getGroups();
+        writeRdbLen(out, groups.size());
+        for (com.redisimpl.server.commands.stream.StreamConsumerGroup g : groups.values()) {
+            writeRdbString(out, g.getName().getBytes(StandardCharsets.UTF_8));
+            writeRdbLen(out, g.getLastDeliveredMillis()); // last_delivered_id.ms
+            writeRdbLen(out, g.getLastDeliveredSeq());    // last_delivered_id.seq
+            writeRdbLen(out, 0);  // entries_read
+            writeRdbLen(out, 0);  // PEL count (simplified)
+            writeRdbLen(out, g.getConsumers().size()); // consumer count
+            for (com.redisimpl.server.commands.stream.StreamConsumerGroup.StreamConsumer c
+                    : g.getConsumers().values()) {
+                writeRdbString(out, c.getName().getBytes(StandardCharsets.UTF_8));
+                writeRdbLen(out, c.getSeenTime()); // seen-time
+                writeRdbLen(out, 0); // active-time
+                writeRdbLen(out, 0); // consumer PEL count
             }
         }
     }

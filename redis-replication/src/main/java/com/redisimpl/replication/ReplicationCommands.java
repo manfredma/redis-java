@@ -128,12 +128,48 @@ public final class ReplicationCommands {
         return fullSyncData; // single byte[] containing header + RDB
     }
 
-    // WAIT numreplicas timeout
+    /**
+     * WAIT numreplicas timeout
+     *
+     * Mirrors waitCommand() in replication.c.
+     * Sends REPLCONF GETACK to all replicas, waits up to timeout ms,
+     * then returns the count of replicas that have acknowledged up to
+     * the current master_repl_offset.
+     */
     @RedisCommand(name = "wait", arity = 3, flags = "noscript",
             firstKey = 0, lastKey = 0, step = 0)
     public byte[] wait(RedisClient client, byte[][] argv) {
-        // Return current number of acknowledged replicas
-        return RespEncoder.encodeInteger(manager.getReplicaCount());
+        long numReplicas, timeoutMs;
+        try {
+            numReplicas = Long.parseLong(new String(argv[1], java.nio.charset.StandardCharsets.UTF_8));
+            timeoutMs   = Long.parseLong(new String(argv[2], java.nio.charset.StandardCharsets.UTF_8));
+        } catch (NumberFormatException e) {
+            return com.redisimpl.server.resp.RespEncoder.encodeError("ERR syntax error");
+        }
+
+        long masterOffset = manager.getMasterOffset();
+
+        // Count replicas already up-to-date — mirrors replicationCountAcksByOffset()
+        long acked = manager.countAckedReplicas(masterOffset);
+        if (acked >= numReplicas) {
+            return RespEncoder.encodeInteger(acked);
+        }
+
+        // Short busy-wait (simplified version of the actual blocking WAIT)
+        if (timeoutMs > 0) {
+            long deadline = System.currentTimeMillis() + Math.min(timeoutMs, 500);
+            while (System.currentTimeMillis() < deadline) {
+                // Send GETACK to all online replicas
+                manager.sendGetAckToReplicas();
+                try { Thread.sleep(10); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); break;
+                }
+                acked = manager.countAckedReplicas(masterOffset);
+                if (acked >= numReplicas) break;
+            }
+        }
+
+        return RespEncoder.encodeInteger(manager.countAckedReplicas(masterOffset));
     }
 
     // ---- helpers ----

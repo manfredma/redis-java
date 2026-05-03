@@ -319,18 +319,131 @@ public final class ServerCommands {
     @RedisCommand(name = "debug", arity = -2, flags = "admin noscript loading stale", firstKey = 0, lastKey = 0, step = 0)
     public byte[] debug(RedisClient client, byte[][] argv) {
         String subCmd = toStr(argv[1]).toUpperCase();
-        if (subCmd.equals("SLEEP")) {
-            if (argv.length > 2) {
-                try {
-                    double secs = Double.parseDouble(toStr(argv[2]));
-                    Thread.sleep((long) (secs * 1000));
-                } catch (Exception ignored) {}
+        switch (subCmd) {
+            case "SLEEP":
+                if (argv.length > 2) {
+                    try {
+                        double secs = Double.parseDouble(toStr(argv[2]));
+                        Thread.sleep((long)(secs * 1000));
+                    } catch (Exception ignored) {}
+                }
+                return RespEncoder.OK;
+            case "SET-ACTIVE-EXPIRE":
+                // argv[2] = 0|1 — control active expire; accepted but not enforced
+                return RespEncoder.OK;
+            case "RELOAD":
+                // Flush and reload from RDB — simplified: just acknowledge
+                return RespEncoder.OK;
+            case "FLUSHALL":
+                for (com.redisimpl.server.db.RedisDb db : server.getDbs()) db.flush();
+                return RespEncoder.OK;
+            case "JMAP":
+            case "CHANGE-REPL-ID":
+            case "QUICKLIST-PACKED-THRESHOLD":
+            case "AOFSTATS":
+                return RespEncoder.OK;
+            case "OBJECT":
+                if (argv.length >= 3) {
+                    com.redisimpl.server.db.RedisDb db = server.getDb(client.getDb());
+                    com.redisimpl.core.object.RedisObject obj = db.lookupKey(argv[2]);
+                    if (obj == null) return RespEncoder.encodeError("ERR no such key");
+                    return RespEncoder.encodeSimpleString("Value at:" + argv[2] +
+                            " refcount:" + obj.getRefcount() + " encoding:" + obj.encodingName());
+                }
+                return RespEncoder.OK;
+            default:
+                return RespEncoder.OK;
+        }
+    }
+
+    /**
+     * LATENCY HISTORY event / LATENCY LATEST / LATENCY RESET [event] / LATENCY GRAPH event
+     *
+     * Mirrors latencyCommand() in latency.c.
+     * Returns empty results (no latency monitoring implemented).
+     */
+    @RedisCommand(name = "latency", arity = -2, flags = "admin loading stale fast", firstKey = 0, lastKey = 0, step = 0)
+    public byte[] latency(RedisClient client, byte[][] argv) {
+        String subCmd = toStr(argv[1]).toUpperCase();
+        switch (subCmd) {
+            case "LATEST":
+                return RespEncoder.EMPTY_ARRAY;
+            case "HISTORY":
+                return RespEncoder.EMPTY_ARRAY;
+            case "RESET":
+                return RespEncoder.encodeInteger(0);
+            case "GRAPH":
+                return RespEncoder.encodeBulkString(toBytes("No latency samples"));
+            case "HELP":
+                return RespEncoder.encodeArray(java.util.Arrays.asList(
+                        toBytes("LATENCY LATEST"),
+                        toBytes("LATENCY HISTORY <event-name>"),
+                        toBytes("LATENCY RESET [<event-name>]"),
+                        toBytes("LATENCY GRAPH <event-name>")));
+            default:
+                return RespEncoder.encodeError("ERR unknown LATENCY subcommand '" + subCmd + "'");
+        }
+    }
+
+    /**
+     * MEMORY USAGE key [SAMPLES count] / MEMORY DOCTOR / MEMORY MALLOC-STATS / MEMORY STATS /
+     * MEMORY PURGE / MEMORY HELP
+     *
+     * Mirrors memoryCommand() in server.c.
+     */
+    @RedisCommand(name = "memory", arity = -2, flags = "readonly", firstKey = 0, lastKey = 0, step = 0)
+    public byte[] memory(RedisClient client, byte[][] argv) {
+        String subCmd = toStr(argv[1]).toUpperCase();
+        switch (subCmd) {
+            case "USAGE": {
+                if (argv.length < 3) return RespEncoder.encodeError("ERR syntax error");
+                com.redisimpl.server.db.RedisDb db = server.getDb(client.getDb());
+                com.redisimpl.core.object.RedisObject obj = db.lookupKey(argv[2]);
+                if (obj == null) return RespEncoder.NULL_BULK;
+                // Rough estimate: 64 bytes overhead + value size
+                long estimate = 64 + estimateObjectSize(obj);
+                return RespEncoder.encodeInteger(estimate);
             }
-            return RespEncoder.OK;
+            case "DOCTOR":
+                return RespEncoder.encodeBulkString(toBytes("Sam, I am Sam\nElsa is good"));
+            case "MALLOC-STATS":
+                return RespEncoder.encodeBulkString(toBytes("jemalloc stats not available (Java GC)"));
+            case "STATS": {
+                List<Object> stats = new ArrayList<>();
+                Runtime rt = Runtime.getRuntime();
+                stats.add(toBytes("peak.allocated"));
+                stats.add(rt.totalMemory());
+                stats.add(toBytes("total.allocated"));
+                stats.add(rt.totalMemory() - rt.freeMemory());
+                stats.add(toBytes("startup.allocated"));
+                stats.add(0L);
+                return RespEncoder.encodeArray(stats);
+            }
+            case "PURGE":
+                System.gc();
+                return RespEncoder.OK;
+            case "HELP":
+                return RespEncoder.encodeArray(java.util.Arrays.asList(
+                        toBytes("MEMORY USAGE <key> [SAMPLES <count>]"),
+                        toBytes("MEMORY DOCTOR"),
+                        toBytes("MEMORY STATS"),
+                        toBytes("MEMORY MALLOC-STATS"),
+                        toBytes("MEMORY PURGE")));
+            default:
+                return RespEncoder.encodeError("ERR unknown MEMORY subcommand '" + subCmd + "'");
         }
-        if (subCmd.equals("RELOAD") || subCmd.equals("FLUSHALL")) {
-            return RespEncoder.OK;
-        }
-        return RespEncoder.OK;
+    }
+
+    private static long estimateObjectSize(com.redisimpl.core.object.RedisObject obj) {
+        Object ptr = obj.getPtr();
+        if (ptr == null) return 16;
+        if (ptr instanceof com.redisimpl.core.sds.Sds)
+            return ((com.redisimpl.core.sds.Sds) ptr).getLen() + 64;
+        if (ptr instanceof byte[]) return ((byte[]) ptr).length + 32;
+        if (ptr instanceof com.redisimpl.core.quicklist.QuickList)
+            return ((com.redisimpl.core.quicklist.QuickList) ptr).llen() * 64;
+        if (ptr instanceof com.redisimpl.core.dict.Dict)
+            return ((com.redisimpl.core.dict.Dict) ptr).size() * 64L;
+        return 64;
     }
 }
